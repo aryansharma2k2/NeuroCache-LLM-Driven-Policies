@@ -1,0 +1,37 @@
+def find_victim_v5(int triggering_cpu, int instr_id, long set, const int * current_set, int ip, int full_addr, int type) -> long:
+  """Add your code here an improved cache replacement policy."""
+
+  return -1
+
+  # We should never reach here.
+  assert(False)
+
+def find_victim_v6(int triggering_cpu, int instr_id, long set, const int * current_set, int ip, int full_addr, int type) -> long:
+  """Add your code here an improved cache replacement policy."""
+
+  return -1
+
+  # We should never reach here.
+  assert(False)
+
+
+def find_victim_v7(int triggering_cpu, int instr_id, long set, const int * current_set, int ip, int full_addr, int type) -> long:
+  """Add your code here an improved cache replacement policy."""
+
+  return -1
+
+  # We should never reach here.
+  assert(False)
+
+
+def find_victim_v8(int triggering_cpu, int instr_id, long set, const int * current_set, int ip, int full_addr, int type) -> long:
+  """Add your code here an improved cache replacement policy."""
+
+  return -1
+
+  # We should never reach here.
+  assert(False)
+
+
+def find_victim_v9(int triggering_cpu, int instr_id, long set, const int * current_set, int ip, int full_addr, int type) -> long:
+  """Add your code here an improved
