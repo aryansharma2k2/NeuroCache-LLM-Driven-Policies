@@ -1,0 +1,3383 @@
+Loaded LLM in 4-bit quantized mode (device_map=auto)
+RL policy training on cuda
+file funsearch/implementation/starting_policies/lru.cc
+source code:
+#include "lru.h"
+
+#include <algorithm>
+#include <cassert>
+
+lru::lru(CACHE* cache) : lru(cache, cache->NUM_SET, cache->NUM_WAY) {}
+
+lru::lru(CACHE* cache, long sets, long ways) : replacement(cache), NUM_WAY(ways), last_used_cycles(static_cast<std::size_t>(sets * ways), 0) {}
+
+long lru::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
+                      champsim::address full_addr, access_type type)
+{
+  auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY);
+  auto end = std::next(begin, NUM_WAY);
+
+  // Find the way whose last use cycle is most distant
+  auto victim = std::min_element(begin, end);
+  assert(begin <= victim);
+  assert(victim < end);
+  return std::distance(begin, victim);
+}
+
+void lru::replacement_cache_fill(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip, champsim::address victim_addr,
+                                 access_type type)
+{
+  // Mark the way as being used on the current cycle
+  last_used_cycles.at((std::size_t)(set * NUM_WAY + way)) = cycle++;
+}
+
+void lru::update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
+                                   champsim::address victim_addr, access_type type, uint8_t hit)
+{
+  // Mark the way as being used on the current cycle
+  if (hit && access_type{type} != access_type::WRITE) // Skip this for writeback hits
+    last_used_cycles.at((std::size_t)(set * NUM_WAY + way)) = cycle++;
+}
+
+parsing function
+ - triggering_cpu : int
+ - instr_id : int
+ - set : long
+ - current_set : const int *
+ - ip : int
+ - full_addr : int
+ - type : int
+Body lines: ['long lru::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,', '                      champsim::address full_addr, access_type type)', '{', '  auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY);', '  auto end = std::next(begin, NUM_WAY);', '', '  // Find the way whose last use cycle is most distant', '  auto victim = std::min_element(begin, end);', '  assert(begin <= victim);', '  assert(victim < end);', '  return std::distance(begin, victim);', '}']
+Return type: long
+parsing function
+ - triggering_cpu : int
+ - set : long
+ - way : long
+ - full_addr : int
+ - ip : int
+ - victim_addr : int
+ - type : int
+Body lines: ['void lru::replacement_cache_fill(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip, champsim::address victim_addr,', '                                 access_type type)', '{', '  // Mark the way as being used on the current cycle', '  last_used_cycles.at((std::size_t)(set * NUM_WAY + way)) = cycle++;', '}']
+Return type: void
+parsing function
+ - triggering_cpu : int
+ - set : long
+ - way : long
+ - full_addr : int
+ - ip : int
+ - victim_addr : int
+ - type : int
+ - hit : int
+Body lines: ['void lru::update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,', '                                   champsim::address victim_addr, access_type type, uint8_t hit)', '{', '  // Mark the way as being used on the current cycle', '  if (hit && access_type{type} != access_type::WRITE) // Skip this for writeback hits', '    last_used_cycles.at((std::size_t)(set * NUM_WAY + way)) = cycle++;', '}']
+Return type: void
+parsing function
+file funsearch/implementation/starting_policies/drrip.cc
+source code:
+#include "drrip.h"
+
+#include <algorithm>
+#include <cassert>
+#include <random>
+#include <utility>
+
+#include "champsim.h"
+
+drrip::drrip(CACHE* cache) : replacement(cache), NUM_SET(cache->NUM_SET), NUM_WAY(cache->NUM_WAY), rrpv(static_cast<std::size_t>(NUM_SET * NUM_WAY))
+{
+  // randomly selected sampler sets
+  std::size_t TOTAL_SDM_SETS = NUM_CPUS * NUM_POLICY * SDM_SIZE;
+  std::generate_n(std::back_inserter(rand_sets), TOTAL_SDM_SETS, std::knuth_b{1});
+  std::sort(std::begin(rand_sets), std::end(rand_sets));
+  std::fill_n(std::back_inserter(PSEL), NUM_CPUS, typename decltype(PSEL)::value_type{0});
+}
+
+unsigned& drrip::get_rrpv(long set, long way) { return rrpv.at(static_cast<std::size_t>(set * NUM_WAY + way)); }
+
+void drrip::update_bip(long set, long way)
+{
+  get_rrpv(set, way) = maxRRPV;
+
+  bip_counter++;
+  if (bip_counter == BIP_MAX) {
+    bip_counter = 0;
+    get_rrpv(set, way) = maxRRPV - 1;
+  }
+}
+
+void drrip::update_srrip(long set, long way) { get_rrpv(set, way) = maxRRPV - 1; }
+
+// called on every cache hit and cache fill
+void drrip::update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
+                                     champsim::address victim_addr, access_type type, uint8_t hit)
+{
+  // do not update replacement state for writebacks
+  if (access_type{type} == access_type::WRITE) {
+    get_rrpv(set, way) = maxRRPV - 1;
+    return;
+  }
+
+  // cache hit
+  if (hit) {
+    get_rrpv(set, way) = 0; // for cache hit, DRRIP always promotes a cache line to the MRU position
+    return;
+  }
+
+  // cache miss
+  auto begin = std::next(std::begin(rand_sets), triggering_cpu * NUM_POLICY * SDM_SIZE);
+  auto end = std::next(begin, NUM_POLICY * SDM_SIZE);
+  auto leader = std::find(begin, end, set);
+
+  if (leader == end) { // follower sets
+    auto selector = PSEL[triggering_cpu];
+    if (selector.value() > (selector.maximum / 2)) { // follow BIP
+      update_bip(set, way);
+    } else { // follow SRRIP
+      update_srrip(set, way);
+    }
+  } else if (leader == begin) { // leader 0: BIP
+    PSEL[triggering_cpu]--;
+    update_bip(set, way);
+  } else if (leader == std::next(begin)) { // leader 1: SRRIP
+    PSEL[triggering_cpu]++;
+    update_srrip(set, way);
+  }
+}
+
+// find replacement victim
+long drrip::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
+                        champsim::address full_addr, access_type type)
+{
+  // look for the maxRRPV line
+  auto begin = std::next(std::begin(rrpv), set * NUM_WAY);
+  auto end = std::next(begin, NUM_WAY);
+
+  auto victim = std::max_element(begin, end);
+  if (auto rrpv_update = maxRRPV - *victim; rrpv_update != 0)
+    for (auto it = begin; it != end; ++it)
+      *it += rrpv_update;
+
+  assert(begin <= victim);
+  assert(victim < end);
+  return std::distance(begin, victim); // cast protected by assertions
+}
+
+parsing function
+Body lines: []
+Return type: int
+parsing function
+ - __threadid : __gthread_t *
+ - __func : void *(*)(void *)
+ - __args : void *
+Body lines: []
+Return type: int
+parsing function
+ - __threadid : __gthread_t
+ - __value_ptr : void **
+Body lines: []
+Return type: int
+parsing function
+ - __threadid : __gthread_t
+Body lines: []
+Return type: int
+parsing function
+ - __t1 : __gthread_t
+ - __t2 : __gthread_t
+Body lines: []
+Return type: int
+parsing function
+Body lines: []
+Return type: __gthread_t
+parsing function
+Body lines: []
+Return type: int
+parsing function
+ - __once : __gthread_once_t *
+ - __func : void (*)()
+Body lines: []
+Return type: int
+parsing function
+ - __key : __gthread_key_t *
+ - __dtor : void (*)(void *)
+Body lines: []
+Return type: int
+parsing function
+ - __key : __gthread_key_t
+Body lines: []
+Return type: int
+parsing function
+ - __key : __gthread_key_t
+Body lines: []
+Return type: void *
+parsing function
+ - __key : __gthread_key_t
+ - __ptr : const void *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: void
+parsing function
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_mutex_t *
+ - __abs_timeout : const __gthread_time_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_recursive_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_recursive_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_recursive_mutex_t *
+ - __abs_timeout : const __gthread_time_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_recursive_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_recursive_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+ - __mutex : __gthread_mutex_t *
+ - __abs_timeout : const __gthread_time_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+ - __mutex : __gthread_recursive_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+Body lines: []
+Return type: int
+parsing function
+ - set : long
+ - way : long
+Body lines: ['unsigned& drrip::get_rrpv(long set, long way) { return rrpv.at(static_cast<std::size_t>(set * NUM_WAY + way)); }']
+Return type: unsigned int &
+parsing function
+ - set : long
+ - way : long
+Body lines: ['void drrip::update_bip(long set, long way)', '{', '  get_rrpv(set, way) = maxRRPV;', '', '  bip_counter++;', '  if (bip_counter == BIP_MAX) {', '    bip_counter = 0;', '    get_rrpv(set, way) = maxRRPV - 1;', '  }', '}']
+Return type: void
+parsing function
+ - set : long
+ - way : long
+Body lines: ['void drrip::update_srrip(long set, long way) { get_rrpv(set, way) = maxRRPV - 1; }']
+Return type: void
+parsing function
+ - triggering_cpu : uint32_t
+ - set : long
+ - way : long
+ - full_addr : int
+ - ip : int
+ - victim_addr : int
+ - type : int
+ - hit : uint8_t
+Body lines: ['void drrip::update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,', '                                     champsim::address victim_addr, access_type type, uint8_t hit)', '{', '  // do not update replacement state for writebacks', '  if (access_type{type} == access_type::WRITE) {', '    get_rrpv(set, way) = maxRRPV - 1;', '    return;', '  }', '', '  // cache hit', '  if (hit) {', '    get_rrpv(set, way) = 0; // for cache hit, DRRIP always promotes a cache line to the MRU position', '    return;', '  }', '', '  // cache miss', '  auto begin = std::next(std::begin(rand_sets), triggering_cpu * NUM_POLICY * SDM_SIZE);', '  auto end = std::next(begin, NUM_POLICY * SDM_SIZE);', '  auto leader = std::find(begin, end, set);', '', '  if (leader == end) { // follower sets', '    auto selector = PSEL[triggering_cpu];', '    if (selector.value() > (selector.maximum / 2)) { // follow BIP', '      update_bip(set, way);', '    } else { // follow SRRIP', '      update_srrip(set, way);', '    }', '  } else if (leader == begin) { // leader 0: BIP', '    PSEL[triggering_cpu]--;', '    update_bip(set, way);', '  } else if (leader == std::next(begin)) { // leader 1: SRRIP', '    PSEL[triggering_cpu]++;', '    update_srrip(set, way);', '  }', '}']
+Return type: void
+parsing function
+ - triggering_cpu : uint32_t
+ - instr_id : uint64_t
+ - set : long
+ - current_set : const int *
+ - ip : int
+ - full_addr : int
+ - type : int
+Body lines: ['long drrip::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,', '                        champsim::address full_addr, access_type type)', '{', '  // look for the maxRRPV line', '  auto begin = std::next(std::begin(rrpv), set * NUM_WAY);', '  auto end = std::next(begin, NUM_WAY);', '', '  auto victim = std::max_element(begin, end);', '  if (auto rrpv_update = maxRRPV - *victim; rrpv_update != 0)', '    for (auto it = begin; it != end; ++it)', '      *it += rrpv_update;', '', '  assert(begin <= victim);', '  assert(victim < end);', '  return std::distance(begin, victim); // cast protected by assertions', '}']
+Return type: long
+parsing function
+file funsearch/implementation/starting_policies/hawkeye_final.cc
+source code:
+//Hawkeye Cache Replacement Tool v2.0
+//UT AUSTIN RESEARCH LICENSE (SOURCE CODE)
+//The University of Texas at Austin has developed certain software and documentation that it desires to
+//make available without charge to anyone for academic, research, experimental or personal use.
+//This license is designed to guarantee freedom to use the software for these purposes. If you wish to
+//distribute or make other use of the software, you may purchase a license to do so from the University of
+//Texas.
+///////////////////////////////////////////////
+//                                            //
+//     Hawkeye [Jain and Lin, ISCA' 16]       //
+//     Akanksha Jain, akanksha@cs.utexas.edu  //
+//                                            //
+///////////////////////////////////////////////
+
+// Source code for configs 1 and 2
+
+#include "../inc/champsim_crc2.h"
+#include <map>
+
+#define NUM_CORE 1
+#define LLC_SETS NUM_CORE*2048
+#define LLC_WAYS 16
+
+//3-bit RRIP counters or all lines
+#define maxRRPV 7
+uint32_t rrpv[LLC_SETS][LLC_WAYS];
+
+
+//Per-set timers; we only use 64 of these
+//Budget = 64 sets * 1 timer per set * 10 bits per timer = 80 bytes
+#define TIMER_SIZE 1024
+uint64_t perset_mytimer[LLC_SETS];
+
+// Signatures for sampled sets; we only use 64 of these
+// Budget = 64 sets * 16 ways * 12-bit signature per line = 1.5B
+uint64_t signatures[LLC_SETS][LLC_WAYS];
+bool prefetched[LLC_SETS][LLC_WAYS];
+
+// Hawkeye Predictors for demand and prefetch requests
+// Predictor with 2K entries and 5-bit counter per entry
+// Budget = 2048*5/8 bytes = 1.2KB
+#define MAX_SHCT 31
+#define SHCT_SIZE_BITS 11
+#define SHCT_SIZE (1<<SHCT_SIZE_BITS)
+#include "hawkeye_predictor.h"
+HAWKEYE_PC_PREDICTOR* demand_predictor;  //Predictor
+HAWKEYE_PC_PREDICTOR* prefetch_predictor;  //Predictor
+
+#define OPTGEN_VECTOR_SIZE 128
+#include "optgen.h"
+OPTgen perset_optgen[LLC_SETS]; // per-set occupancy vectors; we only use 64 of these
+
+#include <math.h>
+#define bitmask(l) (((l) == 64) ? (unsigned long long)(-1LL) : ((1LL << (l))-1LL))
+#define bits(x, i, l) (((x) >> (i)) & bitmask(l))
+//Sample 64 sets per core
+#define SAMPLED_SET(set) (bits(set, 0 , 6) == bits(set, ((unsigned long long)log2(LLC_SETS) - 6), 6) )
+
+// Sampler to track 8x cache history for sampled sets
+// 2800 entris * 4 bytes per entry = 11.2KB
+#define SAMPLED_CACHE_SIZE 2800
+#define SAMPLER_WAYS 8
+#define SAMPLER_SETS SAMPLED_CACHE_SIZE/SAMPLER_WAYS
+vector<map<uint64_t, ADDR_INFO> > addr_history; // Sampler
+
+// initialize replacement state
+void InitReplacementState()
+{
+    for (int i=0; i<LLC_SETS; i++) {
+        for (int j=0; j<LLC_WAYS; j++) {
+            rrpv[i][j] = maxRRPV;
+            signatures[i][j] = 0;
+            prefetched[i][j] = false;
+        }
+        perset_mytimer[i] = 0;
+        perset_optgen[i].init(LLC_WAYS-2);
+    }
+
+    addr_history.resize(SAMPLER_SETS);
+    for (int i=0; i<SAMPLER_SETS; i++) 
+        addr_history[i].clear();
+
+    demand_predictor = new HAWKEYE_PC_PREDICTOR();
+    prefetch_predictor = new HAWKEYE_PC_PREDICTOR();
+
+    cout << "Initialize Hawkeye state" << endl;
+}
+
+// find replacement victim
+// return value should be 0 ~ 15 or 16 (bypass)
+uint32_t find_victim (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)
+{
+    // look for the maxRRPV line
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+        if (rrpv[set][i] == maxRRPV)
+            return i;
+
+    //If we cannot find a cache-averse line, we evict the oldest cache-friendly line
+    uint32_t max_rrip = 0;
+    int32_t lru_victim = -1;
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+    {
+        if (rrpv[set][i] >= max_rrip)
+        {
+            max_rrip = rrpv[set][i];
+            lru_victim = i;
+        }
+    }
+
+    assert (lru_victim != -1);
+    //The predictor is trained negatively on LRU evictions
+    if( SAMPLED_SET(set) )
+    {
+        if(prefetched[set][lru_victim])
+            prefetch_predictor->decrement(signatures[set][lru_victim]);
+        else
+            demand_predictor->decrement(signatures[set][lru_victim]);
+    }
+    return lru_victim;
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+void replace_addr_history_element(unsigned int sampler_set)
+{
+    uint64_t lru_addr = 0;
+    
+    for(map<uint64_t, ADDR_INFO>::iterator it=addr_history[sampler_set].begin(); it != addr_history[sampler_set].end(); it++)
+    {
+   //     uint64_t timer = (it->second).last_quanta;
+
+        if((it->second).lru == (SAMPLER_WAYS-1))
+        {
+            //lru_time =  (it->second).last_quanta;
+            lru_addr = it->first;
+            break;
+        }
+    }
+
+    addr_history[sampler_set].erase(lru_addr);
+}
+
+void update_addr_history_lru(unsigned int sampler_set, unsigned int curr_lru)
+{
+    for(map<uint64_t, ADDR_INFO>::iterator it=addr_history[sampler_set].begin(); it != addr_history[sampler_set].end(); it++)
+    {
+        if((it->second).lru < curr_lru)
+        {
+            (it->second).lru++;
+            assert((it->second).lru < SAMPLER_WAYS); 
+        }
+    }
+}
+
+
+// called on every cache hit and cache fill
+void UpdateReplacementState (uint32_t cpu, uint32_t set, uint32_t way, uint64_t paddr, uint64_t PC, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    paddr = (paddr >> 6) << 6;
+
+    if(type == PREFETCH)
+    {
+        if (!hit)
+            prefetched[set][way] = true;
+    }
+    else
+        prefetched[set][way] = false;
+
+    //Ignore writebacks
+    if (type == WRITEBACK)
+        return;
+
+
+    //If we are sampling, OPTgen will only see accesses from sampled sets
+    if(SAMPLED_SET(set))
+    {
+        //The current timestep 
+        uint64_t curr_quanta = perset_mytimer[set] % OPTGEN_VECTOR_SIZE;
+
+        uint32_t sampler_set = (paddr >> 6) % SAMPLER_SETS; 
+        uint64_t sampler_tag = CRC(paddr >> 12) % 256;
+        assert(sampler_set < SAMPLER_SETS);
+
+        // This line has been used before. Since the right end of a usage interval is always 
+        //a demand, ignore prefetches
+        if((addr_history[sampler_set].find(sampler_tag) != addr_history[sampler_set].end()) && (type != PREFETCH))
+        {
+            unsigned int curr_timer = perset_mytimer[set];
+            if(curr_timer < addr_history[sampler_set][sampler_tag].last_quanta)
+               curr_timer = curr_timer + TIMER_SIZE;
+            bool wrap =  ((curr_timer - addr_history[sampler_set][sampler_tag].last_quanta) > OPTGEN_VECTOR_SIZE);
+            uint64_t last_quanta = addr_history[sampler_set][sampler_tag].last_quanta % OPTGEN_VECTOR_SIZE;
+            //and for prefetch hits, we train the last prefetch trigger PC
+            if( !wrap && perset_optgen[set].should_cache(curr_quanta, last_quanta))
+            {
+                if(addr_history[sampler_set][sampler_tag].prefetched)
+                    prefetch_predictor->increment(addr_history[sampler_set][sampler_tag].PC);
+                else
+                    demand_predictor->increment(addr_history[sampler_set][sampler_tag].PC);
+            }
+            else
+            {
+                //Train the predictor negatively because OPT would not have cached this line
+                if(addr_history[sampler_set][sampler_tag].prefetched)
+                    prefetch_predictor->decrement(addr_history[sampler_set][sampler_tag].PC);
+                else
+                    demand_predictor->decrement(addr_history[sampler_set][sampler_tag].PC);
+            }
+            //Some maintenance operations for OPTgen
+            perset_optgen[set].add_access(curr_quanta);
+            update_addr_history_lru(sampler_set, addr_history[sampler_set][sampler_tag].lru);
+
+            //Since this was a demand access, mark the prefetched bit as false
+            addr_history[sampler_set][sampler_tag].prefetched = false;
+        }
+        // This is the first time we are seeing this line (could be demand or prefetch)
+        else if(addr_history[sampler_set].find(sampler_tag) == addr_history[sampler_set].end())
+        {
+            // Find a victim from the sampled cache if we are sampling
+            if(addr_history[sampler_set].size() == SAMPLER_WAYS) 
+                replace_addr_history_element(sampler_set);
+
+            assert(addr_history[sampler_set].size() < SAMPLER_WAYS);
+            //Initialize a new entry in the sampler
+            addr_history[sampler_set][sampler_tag].init(curr_quanta);
+            //If it's a prefetch, mark the prefetched bit;
+            if(type == PREFETCH)
+            {
+                addr_history[sampler_set][sampler_tag].mark_prefetch();
+                perset_optgen[set].add_prefetch(curr_quanta);
+            }
+            else
+                perset_optgen[set].add_access(curr_quanta);
+            update_addr_history_lru(sampler_set, SAMPLER_WAYS-1);
+        }
+        else //This line is a prefetch
+        {
+            assert(addr_history[sampler_set].find(sampler_tag) != addr_history[sampler_set].end());
+            //if(hit && prefetched[set][way])
+            uint64_t last_quanta = addr_history[sampler_set][sampler_tag].last_quanta % OPTGEN_VECTOR_SIZE;
+            if (perset_mytimer[set] - addr_history[sampler_set][sampler_tag].last_quanta < 5*NUM_CORE) 
+            {
+                if(perset_optgen[set].should_cache(curr_quanta, last_quanta))
+                {
+                    if(addr_history[sampler_set][sampler_tag].prefetched)
+                        prefetch_predictor->increment(addr_history[sampler_set][sampler_tag].PC);
+                    else
+                       demand_predictor->increment(addr_history[sampler_set][sampler_tag].PC);
+                }
+            }
+
+            //Mark the prefetched bit
+            addr_history[sampler_set][sampler_tag].mark_prefetch(); 
+            //Some maintenance operations for OPTgen
+            perset_optgen[set].add_prefetch(curr_quanta);
+            update_addr_history_lru(sampler_set, addr_history[sampler_set][sampler_tag].lru);
+        }
+
+        // Get Hawkeye's prediction for this line
+        bool new_prediction = demand_predictor->get_prediction (PC);
+        if (type == PREFETCH)
+            new_prediction = prefetch_predictor->get_prediction (PC);
+        // Update the sampler with the timestamp, PC and our prediction
+        // For prefetches, the PC will represent the trigger PC
+        addr_history[sampler_set][sampler_tag].update(perset_mytimer[set], PC, new_prediction);
+        addr_history[sampler_set][sampler_tag].lru = 0;
+        //Increment the set timer
+        perset_mytimer[set] = (perset_mytimer[set]+1) % TIMER_SIZE;
+    }
+
+    bool new_prediction = demand_predictor->get_prediction (PC);
+    if (type == PREFETCH)
+        new_prediction = prefetch_predictor->get_prediction (PC);
+
+    signatures[set][way] = PC;
+
+    //Set RRIP values and age cache-friendly line
+    if(!new_prediction)
+        rrpv[set][way] = maxRRPV;
+    else
+    {
+        rrpv[set][way] = 0;
+        if(!hit)
+        {
+            bool saturated = false;
+            for(uint32_t i=0; i<LLC_WAYS; i++)
+                if (rrpv[set][i] == maxRRPV-1)
+                    saturated = true;
+
+            //Age all the cache-friendly  lines
+            for(uint32_t i=0; i<LLC_WAYS; i++)
+            {
+                if (!saturated && rrpv[set][i] < maxRRPV-1)
+                    rrpv[set][i]++;
+            }
+        }
+        rrpv[set][way] = 0;
+    }
+}
+
+// use this function to print out your own stats on every heartbeat 
+void PrintStats_Heartbeat()
+{
+
+}
+
+// use this function to print out your own stats at the end of simulation
+void PrintStats()
+{
+    unsigned int hits = 0;
+    unsigned int accesses = 0;
+    for(unsigned int i=0; i<LLC_SETS; i++)
+    {
+        accesses += perset_optgen[i].access;
+        hits += perset_optgen[i].get_num_opt_hits();
+    }
+
+    std::cout << "OPTgen accesses: " << accesses << std::endl;
+    std::cout << "OPTgen hits: " << hits << std::endl;
+    std::cout << "OPTgen hit rate: " << 100*(double)hits/(double)accesses << std::endl;
+
+    cout << endl << endl;
+    return;
+}
+
+parsing function
+Body lines: ['void InitReplacementState()', '{', '    for (int i=0; i<LLC_SETS; i++) {', '        for (int j=0; j<LLC_WAYS; j++) {', '            rrpv[i][j] = maxRRPV;', '            signatures[i][j] = 0;', '            prefetched[i][j] = false;', '        }', '        perset_mytimer[i] = 0;', '        perset_optgen[i].init(LLC_WAYS-2);', '    }', '', '    addr_history.resize(SAMPLER_SETS);', '    for (int i=0; i<SAMPLER_SETS; i++) ', '        addr_history[i].clear();', '', '    demand_predictor = new HAWKEYE_PC_PREDICTOR();', '    prefetch_predictor = new HAWKEYE_PC_PREDICTOR();', '', '    cout << "Initialize Hawkeye state" << endl;', '}']
+Return type: void
+parsing function
+ - cpu : int
+ - set : int
+ - current_set : const int *
+ - PC : int
+ - paddr : int
+ - type : int
+Body lines: ['uint32_t find_victim (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)', '{', '    // look for the maxRRPV line', '    for (uint32_t i=0; i<LLC_WAYS; i++)', '        if (rrpv[set][i] == maxRRPV)', '            return i;', '', '    //If we cannot find a cache-averse line, we evict the oldest cache-friendly line', '    uint32_t max_rrip = 0;', '    int32_t lru_victim = -1;', '    for (uint32_t i=0; i<LLC_WAYS; i++)', '    {', '        if (rrpv[set][i] >= max_rrip)', '        {', '            max_rrip = rrpv[set][i];', '            lru_victim = i;', '        }', '    }', '', '    assert (lru_victim != -1);', '    //The predictor is trained negatively on LRU evictions', '    if( SAMPLED_SET(set) )', '    {', '        if(prefetched[set][lru_victim])', '            prefetch_predictor->decrement(signatures[set][lru_victim]);', '        else', '            demand_predictor->decrement(signatures[set][lru_victim]);', '    }', '    return lru_victim;', '', '    // WE SHOULD NOT REACH HERE', '    assert(0);', '    return 0;', '}']
+Return type: int
+parsing function
+ - sampler_set : unsigned int
+Body lines: ['void replace_addr_history_element(unsigned int sampler_set)', '{', '    uint64_t lru_addr = 0;', '    ', '    for(map<uint64_t, ADDR_INFO>::iterator it=addr_history[sampler_set].begin(); it != addr_history[sampler_set].end(); it++)', '    {', '   //     uint64_t timer = (it->second).last_quanta;', '', '        if((it->second).lru == (SAMPLER_WAYS-1))', '        {', '            //lru_time =  (it->second).last_quanta;', '            lru_addr = it->first;', '            break;', '        }', '    }', '', '    addr_history[sampler_set].erase(lru_addr);', '}']
+Return type: void
+parsing function
+ - sampler_set : unsigned int
+ - curr_lru : unsigned int
+Body lines: ['void update_addr_history_lru(unsigned int sampler_set, unsigned int curr_lru)', '{', '    for(map<uint64_t, ADDR_INFO>::iterator it=addr_history[sampler_set].begin(); it != addr_history[sampler_set].end(); it++)', '    {', '        if((it->second).lru < curr_lru)', '        {', '            (it->second).lru++;', '            assert((it->second).lru < SAMPLER_WAYS); ', '        }', '    }', '}']
+Return type: void
+parsing function
+ - cpu : int
+ - set : int
+ - way : int
+ - paddr : int
+ - PC : int
+ - victim_addr : int
+ - type : int
+ - hit : int
+Body lines: ['void UpdateReplacementState (uint32_t cpu, uint32_t set, uint32_t way, uint64_t paddr, uint64_t PC, uint64_t victim_addr, uint32_t type, uint8_t hit)', '{', '    paddr = (paddr >> 6) << 6;', '', '    if(type == PREFETCH)', '    {', '        if (!hit)', '            prefetched[set][way] = true;', '    }', '    else', '        prefetched[set][way] = false;', '', '    //Ignore writebacks', '    if (type == WRITEBACK)', '        return;', '', '', '    //If we are sampling, OPTgen will only see accesses from sampled sets', '    if(SAMPLED_SET(set))', '    {', '        //The current timestep ', '        uint64_t curr_quanta = perset_mytimer[set] % OPTGEN_VECTOR_SIZE;', '', '        uint32_t sampler_set = (paddr >> 6) % SAMPLER_SETS; ', '        uint64_t sampler_tag = CRC(paddr >> 12) % 256;', '        assert(sampler_set < SAMPLER_SETS);', '', '        // This line has been used before. Since the right end of a usage interval is always ', '        //a demand, ignore prefetches', '        if((addr_history[sampler_set].find(sampler_tag) != addr_history[sampler_set].end()) && (type != PREFETCH))', '        {', '            unsigned int curr_timer = perset_mytimer[set];', '            if(curr_timer < addr_history[sampler_set][sampler_tag].last_quanta)', '               curr_timer = curr_timer + TIMER_SIZE;', '            bool wrap =  ((curr_timer - addr_history[sampler_set][sampler_tag].last_quanta) > OPTGEN_VECTOR_SIZE);', '            uint64_t last_quanta = addr_history[sampler_set][sampler_tag].last_quanta % OPTGEN_VECTOR_SIZE;', '            //and for prefetch hits, we train the last prefetch trigger PC', '            if( !wrap && perset_optgen[set].should_cache(curr_quanta, last_quanta))', '            {', '                if(addr_history[sampler_set][sampler_tag].prefetched)', '                    prefetch_predictor->increment(addr_history[sampler_set][sampler_tag].PC);', '                else', '                    demand_predictor->increment(addr_history[sampler_set][sampler_tag].PC);', '            }', '            else', '            {', '                //Train the predictor negatively because OPT would not have cached this line', '                if(addr_history[sampler_set][sampler_tag].prefetched)', '                    prefetch_predictor->decrement(addr_history[sampler_set][sampler_tag].PC);', '                else', '                    demand_predictor->decrement(addr_history[sampler_set][sampler_tag].PC);', '            }', '            //Some maintenance operations for OPTgen', '            perset_optgen[set].add_access(curr_quanta);', '            update_addr_history_lru(sampler_set, addr_history[sampler_set][sampler_tag].lru);', '', '            //Since this was a demand access, mark the prefetched bit as false', '            addr_history[sampler_set][sampler_tag].prefetched = false;', '        }', '        // This is the first time we are seeing this line (could be demand or prefetch)', '        else if(addr_history[sampler_set].find(sampler_tag) == addr_history[sampler_set].end())', '        {', '            // Find a victim from the sampled cache if we are sampling', '            if(addr_history[sampler_set].size() == SAMPLER_WAYS) ', '                replace_addr_history_element(sampler_set);', '', '            assert(addr_history[sampler_set].size() < SAMPLER_WAYS);', '            //Initialize a new entry in the sampler', '            addr_history[sampler_set][sampler_tag].init(curr_quanta);', "            //If it's a prefetch, mark the prefetched bit;", '            if(type == PREFETCH)', '            {', '                addr_history[sampler_set][sampler_tag].mark_prefetch();', '                perset_optgen[set].add_prefetch(curr_quanta);', '            }', '            else', '                perset_optgen[set].add_access(curr_quanta);', '            update_addr_history_lru(sampler_set, SAMPLER_WAYS-1);', '        }', '        else //This line is a prefetch', '        {', '            assert(addr_history[sampler_set].find(sampler_tag) != addr_history[sampler_set].end());', '            //if(hit && prefetched[set][way])', '            uint64_t last_quanta = addr_history[sampler_set][sampler_tag].last_quanta % OPTGEN_VECTOR_SIZE;', '            if (perset_mytimer[set] - addr_history[sampler_set][sampler_tag].last_quanta < 5*NUM_CORE) ', '            {', '                if(perset_optgen[set].should_cache(curr_quanta, last_quanta))', '                {', '                    if(addr_history[sampler_set][sampler_tag].prefetched)', '                        prefetch_predictor->increment(addr_history[sampler_set][sampler_tag].PC);', '                    else', '                       demand_predictor->increment(addr_history[sampler_set][sampler_tag].PC);', '                }', '            }', '', '            //Mark the prefetched bit', '            addr_history[sampler_set][sampler_tag].mark_prefetch(); ', '            //Some maintenance operations for OPTgen', '            perset_optgen[set].add_prefetch(curr_quanta);', '            update_addr_history_lru(sampler_set, addr_history[sampler_set][sampler_tag].lru);', '        }', '', "        // Get Hawkeye's prediction for this line", '        bool new_prediction = demand_predictor->get_prediction (PC);', '        if (type == PREFETCH)', '            new_prediction = prefetch_predictor->get_prediction (PC);', '        // Update the sampler with the timestamp, PC and our prediction', '        // For prefetches, the PC will represent the trigger PC', '        addr_history[sampler_set][sampler_tag].update(perset_mytimer[set], PC, new_prediction);', '        addr_history[sampler_set][sampler_tag].lru = 0;', '        //Increment the set timer', '        perset_mytimer[set] = (perset_mytimer[set]+1) % TIMER_SIZE;', '    }', '', '    bool new_prediction = demand_predictor->get_prediction (PC);', '    if (type == PREFETCH)', '        new_prediction = prefetch_predictor->get_prediction (PC);', '', '    signatures[set][way] = PC;', '', '    //Set RRIP values and age cache-friendly line', '    if(!new_prediction)', '        rrpv[set][way] = maxRRPV;', '    else', '    {', '        rrpv[set][way] = 0;', '        if(!hit)', '        {', '            bool saturated = false;', '            for(uint32_t i=0; i<LLC_WAYS; i++)', '                if (rrpv[set][i] == maxRRPV-1)', '                    saturated = true;', '', '            //Age all the cache-friendly  lines', '            for(uint32_t i=0; i<LLC_WAYS; i++)', '            {', '                if (!saturated && rrpv[set][i] < maxRRPV-1)', '                    rrpv[set][i]++;', '            }', '        }', '        rrpv[set][way] = 0;', '    }', '}']
+Return type: void
+parsing function
+Body lines: ['void PrintStats_Heartbeat()', '{', '', '}']
+Return type: void
+parsing function
+Body lines: ['void PrintStats()', '{', '    unsigned int hits = 0;', '    unsigned int accesses = 0;', '    for(unsigned int i=0; i<LLC_SETS; i++)', '    {', '        accesses += perset_optgen[i].access;', '        hits += perset_optgen[i].get_num_opt_hits();', '    }', '', '    std::cout << "OPTgen accesses: " << accesses << std::endl;', '    std::cout << "OPTgen hits: " << hits << std::endl;', '    std::cout << "OPTgen hit rate: " << 100*(double)hits/(double)accesses << std::endl;', '', '    cout << endl << endl;', '    return;', '}']
+Return type: void
+parsing function
+file funsearch/implementation/starting_policies/dancrc2.cc
+source code:
+/*
+ * dancrc2.cc
+ *
+ * Multiperspective Reuse Predictor
+ * 
+ */
+#ifdef CACHE
+#include "./champsim_crc2.h"
+#else
+//#include "../inc/champsim_crc2.h"
+#include "champsim_crc2.h"
+#endif
+
+#include <string.h>
+#include <stdlib.h>
+
+using namespace std;
+
+// set from get_config_number()
+
+unsigned int
+	llc_sets, 
+	num_core;
+
+#define MAX_PATH_LENGTH 16
+#define LLC_WAYS	16
+
+// for printing space calculations
+
+bool
+	**plru_bits, 	// per-set pseudo-LRU bits
+	*lastmiss_bits;	// for lastmiss feature
+
+unsigned char
+	**rrpv;		// for RRIP policy
+
+// one sampler entry
+
+struct sdbp_sampler_entry {
+	unsigned int 	
+		lru_stack_position,
+		tag,
+
+		// copy of the trace used for the most recent prediction
+
+		trace_buffer[MAX_PATH_LENGTH+1];
+		
+	// confidence from most recent prediction
+
+	int conf;
+
+	// constructor
+
+	sdbp_sampler_entry (void) {
+		lru_stack_position = 0;
+		tag = 0;
+	};
+};
+
+// one sampler set (just a pointer to the entries)
+
+struct sdbp_sampler_set {
+	sdbp_sampler_entry *blocks;
+
+	sdbp_sampler_set (void);
+};
+
+// the dead block predictor
+
+struct perceptron_predictor {
+	int **tables; 	// tables of two-bit counters
+	int *table_sizes; // size of each table (not counted against h/w budget)
+
+	perceptron_predictor (void);
+	int get_prediction (uint32_t tid, int set);
+	void block_is_dead (uint32_t tid, sdbp_sampler_entry *, unsigned int *, bool, int, int);
+};
+
+// the sampler
+
+struct sdbp_sampler {
+	sdbp_sampler_set *sets;
+	int 
+		nsampler_sets;   // number of sampler sets
+
+	perceptron_predictor *pred;
+	sdbp_sampler (int nsets, int assoc);
+	void access (uint32_t tid, int set, int real_set, uint64_t tag, uint64_t PC, int, uint64_t);
+};
+
+struct sdbp_sampler; // forward declaration of sampler type
+sdbp_sampler *samp; // pointer to the sampler
+
+int Get_Sampler_Victim ( uint32_t tid, uint32_t setIndex, const BLOCK *current_set, uint32_t assoc, uint64_t PC, uint64_t paddr, uint32_t accessType);
+
+// find replacement victim
+// return value should be 0 ~ 15 or 16 (bypass)
+
+uint32_t GetVictimInSet (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type) {
+	return Get_Sampler_Victim (cpu, set, current_set, LLC_WAYS, PC, paddr, type);
+}
+
+// use this function to print out your own stats on every heartbeat 
+void PrintStats_Heartbeat() { }
+
+// use this function to print out your own stats at the end of simulation
+void PrintStats() { }
+
+static int 
+	lognsets6, // log_2 number of sets plus 6
+	lognsets;  // log_2 number of sets
+
+// trace is built here before prediction
+
+static unsigned int
+	trace_buffer[MAX_PATH_LENGTH+1];
+
+// per-core array of recent PCs
+
+static unsigned int
+	**addresses;
+
+// placement vector (initialized elsewhere)
+
+int plv[3][2] = {
+	{ 0, 0 },
+	{ 0, 0 },
+	{ 0, 0 },
+};
+
+// for set-dueling the best bypass threshold
+
+static int 
+	psel = 0;
+
+// boundaries of leader sets
+
+static unsigned int 
+	leaders1 = 32, 
+	leaders2 = 64;
+
+// parameters
+
+static int
+	dan_promotion_threshold = 256,
+	dan_init_weight = 1,
+	dan_dt1 = 55, dan_dt2 = 1024,
+	dan_rrip_place_position = 0,
+	dan_leaders = 34,
+	dan_ignore_prefetch = 1, // don't predict hitting prefetches
+	dan_use_plru = 0, // 0 means use MDPP, 1 means use PLRU
+	dan_use_rrip = 0, // 1 means use RRIP instead of MDPP/PLRU
+	dan_bypass_threshold = 1000,
+	dan_record_types = 27, // mask for deciding which kinds of memory accesses to record in history
+	// sampler associativity 
+	dan_sampler_assoc = 18,
+	// number of bits used to index predictor; determines number of
+	// entries in prediction tables
+	dan_predictor_index_bits = 8,
+	// number of prediction tables
+	dan_predictor_tables = 16, // default specs have 16 features
+	// width of prediction saturating counters
+	dan_counter_width = 6,
+	// predictor must meet this threshold to predict a block is dead
+	dan_threshold = 8,
+	dan_theta2 = 210,
+	dan_theta = 110,
+	// number of partial tag bits kept per sampler entry
+	dan_sampler_tag_bits = 16,
+	dan_samplers = 80,
+	// number of entries in prediction table; derived from # of index bits
+	dan_predictor_table_entries,
+	// maximum value of saturating counter; derived from counter width
+	dan_counter_min,
+	dan_counter_max;
+
+// called on every cache hit and cache fill
+
+void UpdateSampler (uint32_t setIndex, uint64_t tag, uint32_t tid, uint64_t PC, int32_t way, bool hit, uint32_t accessType, uint64_t paddr);
+
+void UpdateReplacementState (uint32_t cpu, uint32_t set, uint32_t way, uint64_t paddr, uint64_t PC, uint64_t victim_addr, uint32_t type, uint8_t hit) {
+	if (hit && (type == WRITEBACK)) return;
+	uint64_t tag = paddr / (llc_sets * 64);
+	UpdateSampler (set, tag, cpu, PC, way, hit, type, paddr);
+}
+
+// feature types
+
+#define F_PC    0       // PC xor which PC (unless which = 0, then it's just PC)
+#define F_TAG   1       // address
+#define F_BIAS  2       // 0
+#define F_BURST 3
+#define F_INS	4	// this is an insertion
+#define F_LM	5
+#define F_OFF	6
+
+// a feature specifier
+
+struct feature_spec {
+	int     type;   // type of feature
+	int     assoc;  // beyond which a block is considered evicted (dead)
+	int     begin;  // beginning bit
+	int     end;    // ending bit
+	int     which;  // which (for PC)
+	int     xorpc;  // xorpc & 1 => XOR with PC, xorpc & 2 => XOR with PREFETCH
+};
+
+// maximum number of specifiers to read
+
+#define MAX_SPECS       (MAX_PATH_LENGTH+1)
+
+// features for original MICRO 2016 paper
+
+#if 0
+static feature_spec perceptron_specs[] = {
+{ F_PC, 15, 0, 8, 0, 0 },
+{ F_PC, 15, 1, 9, 1, 0 },
+{ F_PC, 15, 2, 10, 2, 0 },
+{ F_PC, 15, 3, 11, 3, 0 },
+{ F_TAG, 15, 25, 33, 0, 0 },
+{ F_TAG, 15, 28, 36, 0, 0 },
+};
+#endif
+
+// features for the various configurations
+
+static feature_spec default_single_1_specs[] = {
+{ F_OFF, 15, 1, 6, 0, 1 },
+{ F_PC, 7, 14, 43, 11, 0 },
+{ F_PC, 16, 3, 11, 16, 1 },
+{ F_INS, 16, 0, 0, 0, 1 },
+{ F_OFF, 10, 0, 6, 0, 1 },
+{ F_PC, 10, 1, 53, 10, 0 },
+{ F_BIAS, 16, 0, 0, 0, 0 },
+{ F_INS, 8, 0, 0, 0, 1 },
+{ F_PC, 17, 6, 20, 0, 1 },
+{ F_BURST, 6, 11, 22, 9, 0 },
+{ F_LM, 9, 0, 0, 0, 0 },
+{ F_PC, 17, 6, 20, 0, 1 },
+{ F_INS, 16, 2, 47, 2, 0 },
+{ F_INS, 17, 0, 0, 0, 1 },
+{ F_PC, 16, 8, 16, 5, 0 },
+{ F_PC, 17, 6, 20, 14, 1 },
+};
+
+static feature_spec default_single_2_specs[] = {
+{ F_INS, 15, 7, 55, 1, 0 },
+{ F_INS, 16, 0, 0, 0, 1 },
+{ F_INS, 6, 13, 38, 0, 1 },
+{ F_OFF, 14, 0, 7, 0, 2 },
+{ F_BIAS, 17, 8, 23, 10, 3 },
+{ F_BURST, 8, 1, 11, 13, 2 },
+{ F_PC, 6, 5, 48, 0, 3 },
+{ F_LM, 15, 16, 44, 0, 2 },
+{ F_TAG, 17, 1, 32, 14, 2 },
+{ F_PC, 17, 6, 20, 0, 1 },
+{ F_PC, 6, 4, 11, 2, 2 },
+{ F_BIAS, 13, 8, 67, 7, 2 },
+{ F_OFF, 8, 1, 6, 0, 2 },
+{ F_PC, 6, 5, 77, 4, 1 },
+{ F_TAG, 11, 8, 19, 7, 0 },
+{ F_TAG, 16, 8, 16, 0, 0 },
+// # 3.511360
+};
+
+static feature_spec default_multi_3_specs[] = {
+{ F_BIAS, 1, 0, 0, 0, 0 },
+{ F_PC, 16, 9, 25, 9, 1 },
+{ F_INS, 8, 4, 8, 7, 2 },
+{ F_PC, 6, 9, 28, 12, 1 },
+{ F_OFF, 14, 1, 4, 0, 3 },
+{ F_LM, 7, 7, 51, 3, 1 },
+{ F_PC, 10, 1, 54, 13, 3 },
+{ F_PC, 10, 3, 32, 5, 1 },
+{ F_PC, 14, 5, 24, 0, 1 },
+{ F_OFF, 13, 4, 4, 0, 2 },
+{ F_TAG, 8, 4, 47, 11, 2 },
+{ F_TAG, 2, 24, 32, 0, 1 },
+{ F_PC, 12, 10, 30, 0, 1 },
+{ F_PC, 12, 9, 28, 0, 2 },
+{ F_PC, 12, 5, 31, 2, 2 },
+{ F_TAG, 8, 10, 8, 7, 1 },
+// # 23.392479
+};
+
+static feature_spec default_multi_4_specs[] = {
+{ F_LM, 9, 5, 17, 4, 0 },
+{ F_PC, 8, 6, 8, 14, 3 },
+{ F_BIAS, 13, 9, 40, 10, 3 },
+{ F_OFF, 8, 2, 2, 0, 2 },
+{ F_TAG, 16, 3, 14, 11, 2 },
+{ F_BURST, 16, 14, 28, 9, 2 },
+{ F_INS, 10, 4, 14, 3, 2 },
+{ F_PC, 14, 3, 18, 10, 2 },
+{ F_INS, 6, 11, 18, 9, 0 },
+{ F_PC, 17, 1, 14, 5, 0 },
+{ F_OFF, 11, 2, 5, 0, 0 },
+{ F_OFF, 15, 0, 7, 0, 3 },
+{ F_TAG, 9, 2, 13, 7, 2 },
+{ F_TAG, 15, 4, 34, 3, 2 },
+{ F_OFF, 10, 0, 6, 0, 1 },
+{ F_PC, 11, 7, 23, 0, 2 },
+// # 9.734541
+};
+
+// which features to use
+
+static feature_spec *specs = NULL;
+
+// for computig space overhead
+
+static int total_bits = 0;
+
+// the configuration number
+
+static int config = 1;
+
+// set the parameters based on configuration number
+
+void set_parameters (void) {
+	switch (config) {
+	case 1: case 5:
+		dan_promotion_threshold = 82;
+		dan_init_weight = 1;
+		dan_dt1 = 56;
+		dan_dt2 = 256;
+		dan_leaders = 34;
+		dan_ignore_prefetch = 1;
+		dan_use_plru = 0;
+		dan_use_rrip = 0;
+		dan_bypass_threshold = 48;
+		dan_record_types = 27;
+		dan_sampler_assoc = 18;
+		dan_predictor_index_bits = 8;
+		dan_predictor_tables = 16;
+		dan_counter_width = 6;
+		dan_threshold = 128;
+		dan_theta = 109;
+		dan_theta2 = 135;
+		dan_sampler_tag_bits = 16;
+		dan_samplers = 80;
+		specs = default_single_1_specs;
+		plv[0][0] = -15;
+		plv[0][1] = 0;
+		plv[1][0] = 35;
+		plv[1][1] = 12;
+		plv[2][0] = 44;
+		plv[2][1] = 15;
+		break;
+	case 2: case 6:
+		dan_promotion_threshold = 178;
+		dan_init_weight = 1;
+		dan_dt1 = 42;
+		dan_dt2 = 48;
+		dan_leaders = 34;
+		dan_ignore_prefetch = 1;
+		dan_use_plru = 0;
+		dan_use_rrip = 0;
+		dan_bypass_threshold = 48;
+		dan_record_types = 27;
+		dan_sampler_assoc = 18;
+		dan_predictor_index_bits = 8;
+		dan_predictor_tables = 16;
+		dan_counter_width = 6;
+		dan_threshold = 128;
+		dan_theta = 109;
+		dan_theta2 = 135;
+		dan_sampler_tag_bits = 16;
+		dan_samplers = 80;
+		specs = default_single_2_specs;
+		plv[0][0] = -15;
+		plv[0][1] = 0;
+		plv[1][0] = 35;
+		plv[1][1] = 12;
+		plv[2][0] = 44;
+		plv[2][1] = 15;
+		break;
+	case 3:
+		dan_promotion_threshold = 256;
+		dan_rrip_place_position = 2,
+		dan_init_weight = 1;
+		dan_dt1 = 27;
+		dan_dt2 = 229;
+		dan_leaders = 34;
+		dan_ignore_prefetch = 1;
+		dan_use_plru = 0;
+		dan_use_rrip = 1;
+		dan_bypass_threshold = -3;
+		dan_record_types = 27;
+		dan_sampler_assoc = 18;
+		dan_predictor_index_bits = 8;
+		dan_predictor_tables = 16;
+		dan_counter_width = 6;
+		dan_threshold = 0;
+		dan_theta = 0;
+		dan_theta2 = 0;
+		dan_sampler_tag_bits = 16;
+		dan_samplers = 308;
+		specs = default_multi_3_specs;
+		plv[0][0] = -230;
+		plv[0][1] = 1;
+		plv[1][0] = 12;
+		plv[1][1] = 2;
+		plv[2][0] = 22;
+		plv[2][1] = 3;
+		break;
+	case 4:
+		dan_promotion_threshold = 256;
+		dan_rrip_place_position = 2,
+		dan_init_weight = 1;
+		dan_dt1 = 100;
+		dan_dt2 = 154;
+		dan_leaders = 34;
+		dan_ignore_prefetch = 1;
+		dan_use_plru = 0;
+		dan_use_rrip = 1;
+		dan_bypass_threshold = -3;
+		dan_record_types = 27;
+		dan_sampler_assoc = 18;
+		dan_predictor_index_bits = 8;
+		dan_predictor_tables = 16;
+		dan_counter_width = 6;
+		dan_threshold = 0;
+		dan_theta = 0;
+		dan_theta2 = 0;
+		dan_sampler_tag_bits = 16;
+		dan_samplers = 337;
+		specs = default_multi_4_specs;
+		plv[0][0] = -111;
+		plv[0][1] = 0;
+		plv[1][0] = -110;
+		plv[1][1] = 2;
+		plv[2][0] = 20;
+		plv[2][1] = 3;
+		break;
+	default: assert (0);
+	}
+}
+
+// initialize replacement state
+
+void InitReplacementState() {
+	config = get_config_number ();
+	switch (config) {
+		case 1: case 2:
+			num_core = 1;
+			llc_sets = 2048;
+			break;
+		case 3: case 4:
+			num_core = 4;
+			llc_sets = 8192;
+			break;
+		case 5: case 6:
+			num_core = 1;
+			llc_sets = 8192;
+			break;
+		default: assert (0);
+	}
+	printf ("config %d, num_core %d, llc_sets %d\n", config, num_core, llc_sets);
+
+	// default parameters
+
+	set_parameters ();
+
+	// this variable helps put physical addresses back together
+
+	if (llc_sets == 2048) {
+		lognsets = 11;
+	} else if (llc_sets == 8192) {
+		lognsets = 13;
+	} else assert (0);
+	lognsets6 = lognsets + 6;
+
+	// initialize replacement state
+
+	if (num_core == 4) {
+
+		// multi-core configurations use RRIP
+
+		rrpv = new unsigned char*[llc_sets];
+		int rrpv_bits = 0;
+		for (unsigned int i=0; i<llc_sets; i++) {
+			rrpv[i] = new unsigned char[LLC_WAYS];
+			memset (rrpv[i], 3, LLC_WAYS);
+			rrpv_bits += 2 * LLC_WAYS;
+		}
+		total_bits += rrpv_bits;
+	} else if (num_core == 1) {
+
+		// single-core configurations use MDPP/PLRU
+
+		int bits = 0;
+		plru_bits = new bool*[llc_sets];
+		for (unsigned int i=0; i<llc_sets; i++) {
+			plru_bits[i] = new bool[LLC_WAYS-1];
+			memset (plru_bits[0], 0, LLC_WAYS-1);
+			bits += LLC_WAYS-1;
+		}
+		total_bits += bits;
+	} else assert (0);
+
+	// per-core arrays of recent PCs (we count the bits later when we know the max PC width)
+
+	addresses = new unsigned int*[num_core];
+	for (unsigned int i=0; i<num_core; i++) {
+		addresses[i] = new unsigned int[MAX_PATH_LENGTH];
+		memset (addresses[i], 0, sizeof (int) * MAX_PATH_LENGTH);
+	}
+
+	// initialize lastmiss feature
+
+	lastmiss_bits = new bool[llc_sets];
+	memset (lastmiss_bits, 0, llc_sets);
+	total_bits += llc_sets;
+
+	// initialize sampler
+
+	samp = new sdbp_sampler (llc_sets, LLC_WAYS);
+
+	// at this point, the specs are set; we can compute the sizes
+
+	int trace_bits = 0;
+	for (int i=0; i<dan_predictor_tables; i++) {
+		switch (specs[i].type) {
+		case F_BIAS:
+		case F_BURST:
+		case F_LM:
+		case F_INS:
+			if (specs[i].xorpc == 0 || specs[i].xorpc == 2) trace_bits += 1; else trace_bits += dan_predictor_index_bits;
+			break;
+		case F_OFF:
+			if (specs[i].xorpc == 0 || specs[i].xorpc == 2) trace_bits += (specs[i].end-specs[i].begin); 
+			else trace_bits += dan_predictor_index_bits;
+			break;
+		default:
+			trace_bits += dan_predictor_index_bits;
+			break;
+		}
+	}
+	int sampler_set_bits = dan_sampler_assoc * (
+		4 // lru stack position
+	+	dan_sampler_tag_bits
+	+	trace_bits		// bits for the trace stored in each sampler entry
+	+ 	9 // confidence bits
+	);
+
+	total_bits += trace_bits;	// global trace buffer
+
+
+	// figure out how many bits we need to store the global array of PCs
+
+	int max_end = 0;
+	for (int i=0; i<dan_predictor_tables; i++) {
+		if (specs[i].type == F_PC) if (specs[i].end > max_end) max_end = specs[i].end;
+	}
+	total_bits += max_end * MAX_PATH_LENGTH * num_core;
+	//int total_bits_allowed = 8 * 32768 * num_core;
+	//int sampler_bits = total_bits_allowed - total_bits;
+	total_bits += 10; // for psel
+	total_bits += 512; // in case someone wants to be pedantic about something
+	total_bits += dan_samplers * sampler_set_bits;
+}
+
+// tree-based PseudoLRU operations
+
+#define PLRU_LEFT(i)    ((i)*2+2)
+#define PLRU_RIGHT(i)   ((i)*2+1)
+#define SETBIT(z,k) ((z)|=(1<<(k)))
+#define GETBIT(z,k) (!!((z)&(1<<(k))))
+
+// most recent access was a cache burst
+
+static bool was_burst;
+
+// update the PseudoLRU replacement state, using the placement vector and
+// predictor confidence on a placement, and promotion threshold on a hit
+
+static void update_plru_mdpp (int set, int32_t wayID, bool hit, int *vector, uint32_t accessType, bool really = true, int conf = 0) {
+	assert (!dan_use_rrip);
+	assert (wayID < 16);
+	bool P[LLC_WAYS-1];
+	memcpy (P, plru_bits[set], LLC_WAYS-1);
+	unsigned int idx = 0;
+	unsigned int x;
+	bool wasodd = false;
+	unsigned int newidx = 0;
+	assert (vector);
+	if (!hit) {
+		if (conf >= plv[2][0]) newidx = plv[2][1];
+		else if (conf >= plv[1][0]) newidx = plv[1][1];
+		else if (conf >= plv[0][0]) newidx = plv[0][1];
+	} else {
+		// get the current plru index
+		// build the index starting from a leaf and going to the root
+		x = wayID + LLC_WAYS - 1;
+		int i = 0;
+		while (x) {
+			wasodd = x & 1;
+			x = (x - 1) >> 1;
+			// FIXME: here we say 3 but it should be log2(assoc)-1
+			if (P[x] == wasodd) SETBIT(idx,3-i);
+			i++;
+		}
+		assert (i == 4);
+		newidx = vector[idx];
+	}
+
+	// set the new plru index for this block
+
+	wasodd = false;
+	x = wayID + LLC_WAYS - 1;
+	int i = 0;
+	bool changed = false;
+	while (x) {
+		wasodd = x & 1;
+		x = (x - 1) >> 1;
+		// FIXME: here we say 3 but it should be log2(assoc)-1
+		bool oldbit = P[x];
+		P[x] = wasodd == GETBIT(newidx,3-i);
+		if (P[x] != oldbit) changed = true;
+		i++;
+	}
+	was_burst = !changed;
+	assert (i == 4);
+	if (conf > dan_promotion_threshold) really = false;
+
+	// we might not "really" want to update state if we are just
+	// calling this function to see if we had a cache burst
+
+	if (really) memcpy (plru_bits[set], P, LLC_WAYS-1);
+}
+
+// get the PseudoLRU victim
+
+static int get_mdpp_plru_victim (int set) {
+	// find the pseudo-lru block
+	bool *P = plru_bits[set];
+
+	int a = LLC_WAYS - 1;
+	unsigned int x = 0;
+	int level = 0;
+	while (a) {
+		level++;
+		if (P[x])
+			x = PLRU_RIGHT(x);
+		else
+			x = PLRU_LEFT(x);
+		a /= 2;
+	}
+	x -= (LLC_WAYS-1);
+	return x;
+}
+
+// make a trace from a PC (just extract some bits)
+
+static void make_trace (uint32_t tid, perceptron_predictor *pred, uint32_t setIndex, uint64_t PC, uint32_t tag, int accessType, bool burst, bool insertion, bool lastmiss, unsigned int offset) {
+	for (int i=0; i<dan_predictor_tables; i++) {
+		feature_spec *f = &specs[i];
+		int begin_shift = f->begin;
+		int end_mask = (1<<(f->end - begin_shift))-1; // TODO: make this a hash instead of a simple bit extract
+		switch (f->type) {
+		case F_PC:
+			if (f->which == 0)
+				trace_buffer[i] = (PC >> begin_shift) & end_mask;
+			else
+				trace_buffer[i] = (addresses[tid][f->which-1] >> begin_shift) & end_mask;
+			break;
+		case F_TAG:
+			trace_buffer[i] = (((tag << lognsets6) | (setIndex << 6)) >> begin_shift) & end_mask;
+			break;
+		case F_BIAS:
+			trace_buffer[i] = 0;
+			break;
+		case F_BURST:
+			trace_buffer[i] = burst;
+			break;
+		case F_INS:
+			trace_buffer[i] = insertion;
+			break;
+		case F_LM:
+			trace_buffer[i] = lastmiss;
+			break;
+		case F_OFF:
+			trace_buffer[i] = (offset >> begin_shift) & end_mask;
+			break;
+		}
+		if (f->xorpc & 1) trace_buffer[i] ^= PC;
+		if (f->xorpc & 2) trace_buffer[i] ^= 2 * (accessType == PREFETCH);
+	}
+}
+
+// multiply bit vector x by matrix m (for shuffling set indices to determine
+// sampler sets)
+
+unsigned int mm (unsigned int x, unsigned int m[]) {
+        unsigned int r = 0;
+        for (int i=0; i<lognsets; i++) {
+                r <<= 1;
+                unsigned int d = x & m[i];
+                r |= __builtin_parity (d);
+        }
+        return r;
+}
+
+// update replacement policy
+
+void UpdateSampler (uint32_t setIndex, uint64_t tag, uint32_t tid, uint64_t PC, int32_t way, bool hit, uint32_t accessType, uint64_t paddr) {
+
+	// don't need to update on a bypass
+
+	if (way >= 16) return;
+
+	// make distinct PCs for hitting/missing prefetches
+
+	if (accessType == PREFETCH) PC ^= (0xdeadbeef + hit);
+
+	// make distinct PCs for hitting/missing writebacks, and skip a
+	// bunch of stuff
+
+	if (accessType == WRITEBACK) {
+		PC ^= 0x7e57ab1e;
+		goto stuff;
+	}
+
+	// ignore hitting prefetches
+
+	if (dan_ignore_prefetch == 1) {
+		if ((accessType == PREFETCH) && hit) goto stuff;
+	}
+
+	// update up/down counter for set-dueling
+
+	if (setIndex < leaders1) {
+		if (!hit) if (psel < 1023) psel++;
+	} else if (setIndex < leaders2) {
+		if (!hit) if (psel > -1023) psel--;
+	}
+
+	// another place where we can ignore hitting prefetches
+
+	if (dan_ignore_prefetch == 2) {
+		if ((accessType == PREFETCH) && hit) goto stuff;
+	}
+	// determine if this is a sampler set
+	{
+		// multiply set index by specially crafted invertible
+		// matrix to distribute sampled sets across cache
+
+		static unsigned int le11[] = { 0x37f, 0x431, 0x71d, 0x25c, 0x719, 0x4d5, 0x4b6, 0x2ca, 0x26d, 0x64f, 0x46d };
+		static unsigned int le13[] = { 0x5c5, 0xcc5, 0xb6b, 0x1bc5, 0x8b, 0x1782, 0x190, 0x15dd, 0x1af8, 0x75e, 0x4a1, 0xb4b, 0x1196 };
+		unsigned int *le = (num_core == 1) ? le11 : le13;
+		int set = mm (setIndex, le);
+
+		// if this is a sampler set, access it
+
+		if (set >= 0 && set < samp->nsampler_sets)
+			samp->access (tid, set, setIndex, tag, PC, accessType, paddr);
+
+		// update default replacement policy (MDPP or PLRU)
+
+		int *vector;
+		static int vecmdpp[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 0, 1, 0, 0 };
+		static int vecplru[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+		vector = dan_use_plru ? vecplru : vecmdpp;
+
+		// do a fake promotion to see if this was a burst so we can get a prediction.
+
+		if (dan_use_rrip) {
+			was_burst = rrpv[setIndex][way] == 0;
+		} else {
+			update_plru_mdpp (setIndex, way, hit, vector, accessType, false);
+		}
+
+		// make the trace
+
+		make_trace (tid, samp->pred, setIndex, PC, tag, accessType, was_burst, !hit, lastmiss_bits[setIndex], paddr & 63);
+
+		// get the next prediction for this block using that trace
+
+		int conf = samp->pred->get_prediction (tid, setIndex);
+		if (dan_use_rrip) {
+
+			// what is the current RRPV value for this block?
+
+			int position = rrpv[setIndex][way];
+			if (!hit) {
+
+				// on a placement, use the placement vector
+
+				position = dan_rrip_place_position;
+				if (conf >= plv[2][0]) position = plv[2][1];
+				else if (conf >= plv[1][0]) position = plv[1][1];
+				else if (conf >= plv[0][0]) position = plv[0][1];
+			} else {
+
+				// on a hit, use the promotion threshold
+
+				if (conf < dan_promotion_threshold)
+					position = 0;
+			}
+
+			// assign the new RRPV
+
+			rrpv[setIndex][way] = position;
+		} else {
+
+			// MDPP/PLRU replacement
+
+			update_plru_mdpp (setIndex, way, hit, vector, accessType, true, conf);
+		}
+	}
+stuff:
+	// update address path
+
+	bool record = false;
+	if (accessType == LOAD) if (dan_record_types & 1) record = true;
+	if (accessType == RFO) if (dan_record_types & 2) record = true;
+	if (accessType == WRITEBACK) if (dan_record_types & 8) record = true;
+	if (accessType == PREFETCH) if (dan_record_types & 16) record = true;
+	if (record) {
+		memmove (&addresses[tid][1], &addresses[tid][0], (MAX_PATH_LENGTH-1) * sizeof (unsigned int));
+		addresses[tid][0] = PC;
+	}
+	lastmiss_bits[setIndex] = !hit;
+}
+
+int find_victim ( uint32_t tid, uint32_t setIndex, const BLOCK *current_set, uint32_t assoc, uint64_t PC, uint64_t paddr, uint32_t accessType) {
+
+	// select a victim using default pseudo LRU policy
+
+	assert (setIndex < llc_sets);
+	int r;
+	if (dan_use_rrip) {
+startover:
+		int lrus[LLC_WAYS], n = 0;
+		for (unsigned int wayID=0; wayID<assoc; wayID++) {
+			if (rrpv[setIndex][wayID] == 3) lrus[n++] = wayID;
+		}
+		if (n) {
+			r = lrus[rand()%n];
+		} else {
+			for (unsigned int wayID=0; wayID<assoc; wayID++) rrpv[setIndex][wayID]++;
+			goto startover;
+		}
+	} else {
+		r = get_mdpp_plru_victim (setIndex);
+	}
+	// we now have a victim, r; predict whether this block is
+	// "dead on arrival" and bypass for non-writeback accesses
+
+	if (accessType != WRITEBACK) {
+		uint32_t tag = paddr / (llc_sets * 64);
+		make_trace (tid, samp->pred, setIndex, PC, tag, accessType, false, true, lastmiss_bits[setIndex], paddr & 63);
+		int prediction;
+		int conf = samp->pred->get_prediction (tid, setIndex);
+		if (dan_dt2) {
+			if (setIndex < leaders1) 
+				prediction = conf >= dan_dt1;
+			else if (setIndex < leaders2)
+				prediction = conf >= dan_dt2;
+			else {
+				if (psel >= 0)
+					prediction = conf >= dan_dt2;
+				else
+					prediction = conf >= dan_dt1;
+			}
+		} else {
+			prediction = conf >= dan_bypass_threshold;
+		}
+	
+		// if block is predicted dead, then it should bypass the cache
+	
+		if (prediction) {
+			r = LLC_WAYS; // means bypass
+		}
+	}
+
+	// return the selected victim
+
+	return r;
+}
+
+// constructor for a sampler set
+
+sdbp_sampler_set::sdbp_sampler_set (void) {
+
+	// allocate some sampler entries
+
+	blocks = new sdbp_sampler_entry[dan_sampler_assoc];
+
+	// initialize the LRU replacement algorithm for these entries
+
+	for (int i=0; i<dan_sampler_assoc; i++)
+		blocks[i].lru_stack_position = i;
+}
+
+// access the sampler with an LLC tag
+
+void sdbp_sampler::access (uint32_t tid, int set, int real_set, uint64_t tag, uint64_t PC, int accessType, uint64_t paddr) {
+
+	// get a pointer to this set's sampler entries
+
+	sdbp_sampler_entry *blocks = &sets[set].blocks[0];
+
+	// get a partial tag to search for
+
+	unsigned int partial_tag = tag & ((1<<dan_sampler_tag_bits)-1);
+
+	// this will be the way of the sampler entry we end up hitting or replacing
+
+	int i;
+
+	// search for a matching tag
+
+	// no valid bits; tags are initialized to 0, and if we accidentally
+	// match a 0 that's OK because we don't need correctness
+
+	for (i=0; i<dan_sampler_assoc; i++) if (blocks[i].tag == partial_tag) {
+
+		// we know this block is not dead; inform the predictor
+
+		pred->block_is_dead (tid, &blocks[i], blocks[i].trace_buffer, false, blocks[i].conf, blocks[i].lru_stack_position);
+		break;
+	}
+
+	// did we find a match?
+
+	bool is_fill = false;
+
+	if (i == dan_sampler_assoc) {
+
+		// find the LRU block
+
+		if (i == dan_sampler_assoc) {
+			int j;
+			for (j=0; j<dan_sampler_assoc; j++)
+				if (blocks[j].lru_stack_position == (unsigned int) (dan_sampler_assoc-1)) break;
+			assert (j < dan_sampler_assoc);
+			i = j;
+		}
+
+		// previous trace leads to block being dead; inform the predictor
+
+		pred->block_is_dead (tid, &blocks[i], blocks[i].trace_buffer, true, blocks[i].conf, dan_sampler_assoc);
+
+		// reminds us to fill the block later (after we're done
+		// using the current victim's metadata)
+
+		is_fill = true;
+	}
+
+	// now the replaced or hit entry should be moved to the MRU position
+
+	unsigned int position = blocks[i].lru_stack_position;
+	for(int way=0; way<dan_sampler_assoc; way++) {
+		if (blocks[way].lru_stack_position < position) {
+			blocks[way].lru_stack_position++;
+			// inform the predictor that this block has reached
+			// this position
+			pred->block_is_dead (tid, &blocks[way], blocks[way].trace_buffer, true, blocks[way].conf, blocks[way].lru_stack_position);
+		}
+	}
+	blocks[i].lru_stack_position = 0;
+
+	if (is_fill) {
+		// fill the victim block
+
+		blocks[i].tag = partial_tag;
+	}
+
+	// record the trace
+
+	make_trace (tid, pred, real_set, PC, tag, accessType, position == 0, is_fill, lastmiss_bits[real_set], paddr & 63);
+	memcpy (blocks[i].trace_buffer, trace_buffer, (MAX_PATH_LENGTH+1) * sizeof (unsigned int));
+
+	// get the next prediction for this entry
+
+	blocks[i].conf = pred->get_prediction (tid, -1);
+}
+
+sdbp_sampler::sdbp_sampler (int nsets, int assoc) {
+	if (num_core == 1) assert (!dan_use_rrip);
+	if (num_core == 4) assert (dan_use_rrip);
+	leaders1 = dan_leaders * 1;
+	leaders2 = dan_leaders * 2;
+
+	// here, we figure out the total number of bits used by the various
+	// structures etc.  along the way we will figure out how many
+	// sampler sets we have room for
+
+	dan_predictor_table_entries = 1 << dan_predictor_index_bits;
+	nsampler_sets = dan_samplers;
+
+	if (nsampler_sets > nsets) {
+		nsampler_sets = nsets;
+		fprintf (stderr, "warning: number of sampler sets exceeds number of real sets, setting nsampler_sets to %d\n", nsampler_sets);
+		fflush (stderr);
+	}
+
+	// compute the maximum saturating counter value; predictor constructor
+	// needs this so we do it here
+
+	dan_counter_max = (1 << (dan_counter_width-1)) -1;
+	dan_counter_min = -(1 << (dan_counter_width-1));
+
+	// make a predictor
+
+	pred = new perceptron_predictor ();
+
+	// we should have at least one sampler set
+
+	assert (nsampler_sets >= 0);
+
+	// make the sampler sets
+
+	sets = new sdbp_sampler_set [nsampler_sets];
+}
+
+// constructor for the predictor
+
+perceptron_predictor::perceptron_predictor (void) {
+
+	// make the tables
+
+	tables = new int* [dan_predictor_tables];
+	table_sizes = new int[dan_predictor_tables];
+
+	// initialize each table
+
+	for (int i=0; i<dan_predictor_tables; i++) {
+		int table_entries;
+		switch (specs[i].type) {
+		// 1 bit features
+		case F_BIAS:
+		case F_BURST:
+		case F_LM:
+		case F_INS:
+			if (specs[i].xorpc == 0) table_entries = 2; else if (specs[i].xorpc == 2) table_entries = 4; else table_entries = dan_predictor_table_entries;
+			break;
+		case F_OFF:
+			if (specs[i].xorpc == false) table_entries = 1<<(specs[i].end-specs[i].begin); else table_entries = dan_predictor_table_entries;
+			break;
+		default:
+			table_entries = dan_predictor_table_entries;
+		}
+		table_sizes[i] = table_entries;
+		tables[i] = new int[table_entries];
+		for (int j=0; j<table_entries; j++) tables[i][j] = dan_init_weight;
+		total_bits += 6 * table_entries;
+	}
+}
+
+// inform the predictor that a block is either dead or not dead
+// NOTE: the trace_buffer parameter here is from the block in the sampled
+// set, not the global trace_buffer variable. yes, it is a hack.
+
+void perceptron_predictor::block_is_dead (uint32_t tid, sdbp_sampler_entry *block, unsigned int *trace_buffer, bool d, int conf, int pos) {
+
+	bool prediction = conf >= dan_threshold;
+	bool correct = prediction == d;
+
+	// perceptron learning rule: don't train if the prediction is
+	// correct and the confidence is greater than some theta
+
+	bool do_train = false;
+	if (conf < 0) {
+		if (conf > -dan_theta2) do_train = true;
+	} else {
+		if (conf < dan_theta) do_train = true;
+	}
+	if (!correct) do_train = true;
+	if (!do_train) return;
+
+	for (int i=0; i<dan_predictor_tables; i++) {
+		// for a "dead" block, only train wrt the associativity
+		// for this feature
+
+		if (d) if (specs[i].assoc != pos) continue;
+
+		// for a "live" block, only train if it would have been a hit not a placement
+
+		if (!d) if (specs[i].assoc <= pos) continue;
+
+		// ...get a pointer to the corresponding entry in that table
+
+		//int *c = &tables[i][trace_buffer[i] & ((1<<dan_predictor_index_bits)-1)];
+		int *c = &tables[i][trace_buffer[i] % table_sizes[i]];
+
+		// if the block is dead, increment the counter
+
+		if (d) {
+			if (*c < dan_counter_max) (*c)++;
+		} else {
+			if (*c > dan_counter_min) (*c)--;
+		}
+	}
+}
+
+// get a prediction for a given trace
+// the trace is in trace_buffer[0..MAX_PATH_LENGTH]
+
+int perceptron_predictor::get_prediction (uint32_t tid, int set) {
+
+	// start the confidence sum as 0
+
+	int conf = 0;
+
+	// for each table...
+	for (int i=0; i<dan_predictor_tables; i++) {
+
+		// ...get the counter value for that table...
+
+		//int val = tables[i][trace_buffer[i] & ((1<<dan_predictor_index_bits)-1)];
+		int val = tables[i][trace_buffer[i] % table_sizes[i]];
+
+		// and add it to the running total
+
+		conf += val;
+	}
+
+	// if the counter is at least the threshold, the block is predicted dead
+
+	// keep stored confidence to 9 bits
+	if (conf > 255) conf = 255;
+	if (conf < -256) conf = -256;
+	return conf;
+}
+
+parsing function
+ - tid : int
+ - setIndex : int
+ - current_set : const int *
+ - assoc : int
+ - PC : int
+ - paddr : int
+ - accessType : int
+Body lines: ['int Get_Sampler_Victim ( uint32_t tid, uint32_t setIndex, const BLOCK *current_set, uint32_t assoc, uint64_t PC, uint64_t paddr, uint32_t accessType);']
+Return type: int
+parsing function
+ - cpu : int
+ - set : int
+ - current_set : const int *
+ - PC : int
+ - paddr : int
+ - type : int
+Body lines: ['uint32_t GetVictimInSet (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type) {', '\treturn Get_Sampler_Victim (cpu, set, current_set, LLC_WAYS, PC, paddr, type);', '}']
+Return type: int
+parsing function
+Body lines: ['void PrintStats_Heartbeat() { }']
+Return type: void
+parsing function
+Body lines: ['void PrintStats() { }']
+Return type: void
+parsing function
+ - setIndex : int
+ - tag : int
+ - tid : int
+ - PC : int
+ - way : int32_t
+ - hit : bool
+ - accessType : int
+ - paddr : int
+Body lines: ['void UpdateSampler (uint32_t setIndex, uint64_t tag, uint32_t tid, uint64_t PC, int32_t way, bool hit, uint32_t accessType, uint64_t paddr);']
+Return type: void
+parsing function
+ - cpu : int
+ - set : int
+ - way : int
+ - paddr : int
+ - PC : int
+ - victim_addr : int
+ - type : int
+ - hit : int
+Body lines: ['void UpdateReplacementState (uint32_t cpu, uint32_t set, uint32_t way, uint64_t paddr, uint64_t PC, uint64_t victim_addr, uint32_t type, uint8_t hit) {', '\tif (hit && (type == WRITEBACK)) return;', '\tuint64_t tag = paddr / (llc_sets * 64);', '\tUpdateSampler (set, tag, cpu, PC, way, hit, type, paddr);', '}']
+Return type: void
+parsing function
+Body lines: ['void set_parameters (void) {', '\tswitch (config) {', '\tcase 1: case 5:', '\t\tdan_promotion_threshold = 82;', '\t\tdan_init_weight = 1;', '\t\tdan_dt1 = 56;', '\t\tdan_dt2 = 256;', '\t\tdan_leaders = 34;', '\t\tdan_ignore_prefetch = 1;', '\t\tdan_use_plru = 0;', '\t\tdan_use_rrip = 0;', '\t\tdan_bypass_threshold = 48;', '\t\tdan_record_types = 27;', '\t\tdan_sampler_assoc = 18;', '\t\tdan_predictor_index_bits = 8;', '\t\tdan_predictor_tables = 16;', '\t\tdan_counter_width = 6;', '\t\tdan_threshold = 128;', '\t\tdan_theta = 109;', '\t\tdan_theta2 = 135;', '\t\tdan_sampler_tag_bits = 16;', '\t\tdan_samplers = 80;', '\t\tspecs = default_single_1_specs;', '\t\tplv[0][0] = -15;', '\t\tplv[0][1] = 0;', '\t\tplv[1][0] = 35;', '\t\tplv[1][1] = 12;', '\t\tplv[2][0] = 44;', '\t\tplv[2][1] = 15;', '\t\tbreak;', '\tcase 2: case 6:', '\t\tdan_promotion_threshold = 178;', '\t\tdan_init_weight = 1;', '\t\tdan_dt1 = 42;', '\t\tdan_dt2 = 48;', '\t\tdan_leaders = 34;', '\t\tdan_ignore_prefetch = 1;', '\t\tdan_use_plru = 0;', '\t\tdan_use_rrip = 0;', '\t\tdan_bypass_threshold = 48;', '\t\tdan_record_types = 27;', '\t\tdan_sampler_assoc = 18;', '\t\tdan_predictor_index_bits = 8;', '\t\tdan_predictor_tables = 16;', '\t\tdan_counter_width = 6;', '\t\tdan_threshold = 128;', '\t\tdan_theta = 109;', '\t\tdan_theta2 = 135;', '\t\tdan_sampler_tag_bits = 16;', '\t\tdan_samplers = 80;', '\t\tspecs = default_single_2_specs;', '\t\tplv[0][0] = -15;', '\t\tplv[0][1] = 0;', '\t\tplv[1][0] = 35;', '\t\tplv[1][1] = 12;', '\t\tplv[2][0] = 44;', '\t\tplv[2][1] = 15;', '\t\tbreak;', '\tcase 3:', '\t\tdan_promotion_threshold = 256;', '\t\tdan_rrip_place_position = 2,', '\t\tdan_init_weight = 1;', '\t\tdan_dt1 = 27;', '\t\tdan_dt2 = 229;', '\t\tdan_leaders = 34;', '\t\tdan_ignore_prefetch = 1;', '\t\tdan_use_plru = 0;', '\t\tdan_use_rrip = 1;', '\t\tdan_bypass_threshold = -3;', '\t\tdan_record_types = 27;', '\t\tdan_sampler_assoc = 18;', '\t\tdan_predictor_index_bits = 8;', '\t\tdan_predictor_tables = 16;', '\t\tdan_counter_width = 6;', '\t\tdan_threshold = 0;', '\t\tdan_theta = 0;', '\t\tdan_theta2 = 0;', '\t\tdan_sampler_tag_bits = 16;', '\t\tdan_samplers = 308;', '\t\tspecs = default_multi_3_specs;', '\t\tplv[0][0] = -230;', '\t\tplv[0][1] = 1;', '\t\tplv[1][0] = 12;', '\t\tplv[1][1] = 2;', '\t\tplv[2][0] = 22;', '\t\tplv[2][1] = 3;', '\t\tbreak;', '\tcase 4:', '\t\tdan_promotion_threshold = 256;', '\t\tdan_rrip_place_position = 2,', '\t\tdan_init_weight = 1;', '\t\tdan_dt1 = 100;', '\t\tdan_dt2 = 154;', '\t\tdan_leaders = 34;', '\t\tdan_ignore_prefetch = 1;', '\t\tdan_use_plru = 0;', '\t\tdan_use_rrip = 1;', '\t\tdan_bypass_threshold = -3;', '\t\tdan_record_types = 27;', '\t\tdan_sampler_assoc = 18;', '\t\tdan_predictor_index_bits = 8;', '\t\tdan_predictor_tables = 16;', '\t\tdan_counter_width = 6;', '\t\tdan_threshold = 0;', '\t\tdan_theta = 0;', '\t\tdan_theta2 = 0;', '\t\tdan_sampler_tag_bits = 16;', '\t\tdan_samplers = 337;', '\t\tspecs = default_multi_4_specs;', '\t\tplv[0][0] = -111;', '\t\tplv[0][1] = 0;', '\t\tplv[1][0] = -110;', '\t\tplv[1][1] = 2;', '\t\tplv[2][0] = 20;', '\t\tplv[2][1] = 3;', '\t\tbreak;', '\tdefault: assert (0);', '\t}', '}']
+Return type: void
+parsing function
+Body lines: ['void InitReplacementState() {', '\tconfig = get_config_number ();', '\tswitch (config) {', '\t\tcase 1: case 2:', '\t\t\tnum_core = 1;', '\t\t\tllc_sets = 2048;', '\t\t\tbreak;', '\t\tcase 3: case 4:', '\t\t\tnum_core = 4;', '\t\t\tllc_sets = 8192;', '\t\t\tbreak;', '\t\tcase 5: case 6:', '\t\t\tnum_core = 1;', '\t\t\tllc_sets = 8192;', '\t\t\tbreak;', '\t\tdefault: assert (0);', '\t}', '\tprintf ("config %d, num_core %d, llc_sets %d\\n", config, num_core, llc_sets);', '', '\t// default parameters', '', '\tset_parameters ();', '', '\t// this variable helps put physical addresses back together', '', '\tif (llc_sets == 2048) {', '\t\tlognsets = 11;', '\t} else if (llc_sets == 8192) {', '\t\tlognsets = 13;', '\t} else assert (0);', '\tlognsets6 = lognsets + 6;', '', '\t// initialize replacement state', '', '\tif (num_core == 4) {', '', '\t\t// multi-core configurations use RRIP', '', '\t\trrpv = new unsigned char*[llc_sets];', '\t\tint rrpv_bits = 0;', '\t\tfor (unsigned int i=0; i<llc_sets; i++) {', '\t\t\trrpv[i] = new unsigned char[LLC_WAYS];', '\t\t\tmemset (rrpv[i], 3, LLC_WAYS);', '\t\t\trrpv_bits += 2 * LLC_WAYS;', '\t\t}', '\t\ttotal_bits += rrpv_bits;', '\t} else if (num_core == 1) {', '', '\t\t// single-core configurations use MDPP/PLRU', '', '\t\tint bits = 0;', '\t\tplru_bits = new bool*[llc_sets];', '\t\tfor (unsigned int i=0; i<llc_sets; i++) {', '\t\t\tplru_bits[i] = new bool[LLC_WAYS-1];', '\t\t\tmemset (plru_bits[0], 0, LLC_WAYS-1);', '\t\t\tbits += LLC_WAYS-1;', '\t\t}', '\t\ttotal_bits += bits;', '\t} else assert (0);', '', '\t// per-core arrays of recent PCs (we count the bits later when we know the max PC width)', '', '\taddresses = new unsigned int*[num_core];', '\tfor (unsigned int i=0; i<num_core; i++) {', '\t\taddresses[i] = new unsigned int[MAX_PATH_LENGTH];', '\t\tmemset (addresses[i], 0, sizeof (int) * MAX_PATH_LENGTH);', '\t}', '', '\t// initialize lastmiss feature', '', '\tlastmiss_bits = new bool[llc_sets];', '\tmemset (lastmiss_bits, 0, llc_sets);', '\ttotal_bits += llc_sets;', '', '\t// initialize sampler', '', '\tsamp = new sdbp_sampler (llc_sets, LLC_WAYS);', '', '\t// at this point, the specs are set; we can compute the sizes', '', '\tint trace_bits = 0;', '\tfor (int i=0; i<dan_predictor_tables; i++) {', '\t\tswitch (specs[i].type) {', '\t\tcase F_BIAS:', '\t\tcase F_BURST:', '\t\tcase F_LM:', '\t\tcase F_INS:', '\t\t\tif (specs[i].xorpc == 0 || specs[i].xorpc == 2) trace_bits += 1; else trace_bits += dan_predictor_index_bits;', '\t\t\tbreak;', '\t\tcase F_OFF:', '\t\t\tif (specs[i].xorpc == 0 || specs[i].xorpc == 2) trace_bits += (specs[i].end-specs[i].begin); ', '\t\t\telse trace_bits += dan_predictor_index_bits;', '\t\t\tbreak;', '\t\tdefault:', '\t\t\ttrace_bits += dan_predictor_index_bits;', '\t\t\tbreak;', '\t\t}', '\t}', '\tint sampler_set_bits = dan_sampler_assoc * (', '\t\t4 // lru stack position', '\t+\tdan_sampler_tag_bits', '\t+\ttrace_bits\t\t// bits for the trace stored in each sampler entry', '\t+ \t9 // confidence bits', '\t);', '', '\ttotal_bits += trace_bits;\t// global trace buffer', '', '', '\t// figure out how many bits we need to store the global array of PCs', '', '\tint max_end = 0;', '\tfor (int i=0; i<dan_predictor_tables; i++) {', '\t\tif (specs[i].type == F_PC) if (specs[i].end > max_end) max_end = specs[i].end;', '\t}', '\ttotal_bits += max_end * MAX_PATH_LENGTH * num_core;', '\t//int total_bits_allowed = 8 * 32768 * num_core;', '\t//int sampler_bits = total_bits_allowed - total_bits;', '\ttotal_bits += 10; // for psel', '\ttotal_bits += 512; // in case someone wants to be pedantic about something', '\ttotal_bits += dan_samplers * sampler_set_bits;', '}']
+Return type: void
+parsing function
+ - set : int
+ - wayID : int32_t
+ - hit : bool
+ - vector : int *
+ - accessType : int
+ - really : bool
+ - conf : int
+Body lines: ['static void update_plru_mdpp (int set, int32_t wayID, bool hit, int *vector, uint32_t accessType, bool really = true, int conf = 0) {', '\tassert (!dan_use_rrip);', '\tassert (wayID < 16);', '\tbool P[LLC_WAYS-1];', '\tmemcpy (P, plru_bits[set], LLC_WAYS-1);', '\tunsigned int idx = 0;', '\tunsigned int x;', '\tbool wasodd = false;', '\tunsigned int newidx = 0;', '\tassert (vector);', '\tif (!hit) {', '\t\tif (conf >= plv[2][0]) newidx = plv[2][1];', '\t\telse if (conf >= plv[1][0]) newidx = plv[1][1];', '\t\telse if (conf >= plv[0][0]) newidx = plv[0][1];', '\t} else {', '\t\t// get the current plru index', '\t\t// build the index starting from a leaf and going to the root', '\t\tx = wayID + LLC_WAYS - 1;', '\t\tint i = 0;', '\t\twhile (x) {', '\t\t\twasodd = x & 1;', '\t\t\tx = (x - 1) >> 1;', '\t\t\t// FIXME: here we say 3 but it should be log2(assoc)-1', '\t\t\tif (P[x] == wasodd) SETBIT(idx,3-i);', '\t\t\ti++;', '\t\t}', '\t\tassert (i == 4);', '\t\tnewidx = vector[idx];', '\t}', '', '\t// set the new plru index for this block', '', '\twasodd = false;', '\tx = wayID + LLC_WAYS - 1;', '\tint i = 0;', '\tbool changed = false;', '\twhile (x) {', '\t\twasodd = x & 1;', '\t\tx = (x - 1) >> 1;', '\t\t// FIXME: here we say 3 but it should be log2(assoc)-1', '\t\tbool oldbit = P[x];', '\t\tP[x] = wasodd == GETBIT(newidx,3-i);', '\t\tif (P[x] != oldbit) changed = true;', '\t\ti++;', '\t}', '\twas_burst = !changed;', '\tassert (i == 4);', '\tif (conf > dan_promotion_threshold) really = false;', '', '\t// we might not "really" want to update state if we are just', '\t// calling this function to see if we had a cache burst', '', '\tif (really) memcpy (plru_bits[set], P, LLC_WAYS-1);', '}']
+Return type: void
+parsing function
+ - set : int
+Body lines: ['static int get_mdpp_plru_victim (int set) {', '\t// find the pseudo-lru block', '\tbool *P = plru_bits[set];', '', '\tint a = LLC_WAYS - 1;', '\tunsigned int x = 0;', '\tint level = 0;', '\twhile (a) {', '\t\tlevel++;', '\t\tif (P[x])', '\t\t\tx = PLRU_RIGHT(x);', '\t\telse', '\t\t\tx = PLRU_LEFT(x);', '\t\ta /= 2;', '\t}', '\tx -= (LLC_WAYS-1);', '\treturn x;', '}']
+Return type: int
+parsing function
+ - tid : int
+ - pred : perceptron_predictor *
+ - setIndex : int
+ - PC : int
+ - tag : int
+ - accessType : int
+ - burst : bool
+ - insertion : bool
+ - lastmiss : bool
+ - offset : unsigned int
+Body lines: ['static void make_trace (uint32_t tid, perceptron_predictor *pred, uint32_t setIndex, uint64_t PC, uint32_t tag, int accessType, bool burst, bool insertion, bool lastmiss, unsigned int offset) {', '\tfor (int i=0; i<dan_predictor_tables; i++) {', '\t\tfeature_spec *f = &specs[i];', '\t\tint begin_shift = f->begin;', '\t\tint end_mask = (1<<(f->end - begin_shift))-1; // TODO: make this a hash instead of a simple bit extract', '\t\tswitch (f->type) {', '\t\tcase F_PC:', '\t\t\tif (f->which == 0)', '\t\t\t\ttrace_buffer[i] = (PC >> begin_shift) & end_mask;', '\t\t\telse', '\t\t\t\ttrace_buffer[i] = (addresses[tid][f->which-1] >> begin_shift) & end_mask;', '\t\t\tbreak;', '\t\tcase F_TAG:', '\t\t\ttrace_buffer[i] = (((tag << lognsets6) | (setIndex << 6)) >> begin_shift) & end_mask;', '\t\t\tbreak;', '\t\tcase F_BIAS:', '\t\t\ttrace_buffer[i] = 0;', '\t\t\tbreak;', '\t\tcase F_BURST:', '\t\t\ttrace_buffer[i] = burst;', '\t\t\tbreak;', '\t\tcase F_INS:', '\t\t\ttrace_buffer[i] = insertion;', '\t\t\tbreak;', '\t\tcase F_LM:', '\t\t\ttrace_buffer[i] = lastmiss;', '\t\t\tbreak;', '\t\tcase F_OFF:', '\t\t\ttrace_buffer[i] = (offset >> begin_shift) & end_mask;', '\t\t\tbreak;', '\t\t}', '\t\tif (f->xorpc & 1) trace_buffer[i] ^= PC;', '\t\tif (f->xorpc & 2) trace_buffer[i] ^= 2 * (accessType == PREFETCH);', '\t}', '}']
+Return type: void
+parsing function
+ - x : unsigned int
+ - m : unsigned int[]
+Body lines: ['unsigned int mm (unsigned int x, unsigned int m[]) {', '        unsigned int r = 0;', '        for (int i=0; i<lognsets; i++) {', '                r <<= 1;', '                unsigned int d = x & m[i];', '                r |= __builtin_parity (d);', '        }', '        return r;', '}']
+Return type: unsigned int
+parsing function
+ - setIndex : int
+ - tag : int
+ - tid : int
+ - PC : int
+ - way : int32_t
+ - hit : bool
+ - accessType : int
+ - paddr : int
+Body lines: ['void UpdateSampler (uint32_t setIndex, uint64_t tag, uint32_t tid, uint64_t PC, int32_t way, bool hit, uint32_t accessType, uint64_t paddr) {', '', "\t// don't need to update on a bypass", '', '\tif (way >= 16) return;', '', '\t// make distinct PCs for hitting/missing prefetches', '', '\tif (accessType == PREFETCH) PC ^= (0xdeadbeef + hit);', '', '\t// make distinct PCs for hitting/missing writebacks, and skip a', '\t// bunch of stuff', '', '\tif (accessType == WRITEBACK) {', '\t\tPC ^= 0x7e57ab1e;', '\t\tgoto stuff;', '\t}', '', '\t// ignore hitting prefetches', '', '\tif (dan_ignore_prefetch == 1) {', '\t\tif ((accessType == PREFETCH) && hit) goto stuff;', '\t}', '', '\t// update up/down counter for set-dueling', '', '\tif (setIndex < leaders1) {', '\t\tif (!hit) if (psel < 1023) psel++;', '\t} else if (setIndex < leaders2) {', '\t\tif (!hit) if (psel > -1023) psel--;', '\t}', '', '\t// another place where we can ignore hitting prefetches', '', '\tif (dan_ignore_prefetch == 2) {', '\t\tif ((accessType == PREFETCH) && hit) goto stuff;', '\t}', '\t// determine if this is a sampler set', '\t{', '\t\t// multiply set index by specially crafted invertible', '\t\t// matrix to distribute sampled sets across cache', '', '\t\tstatic unsigned int le11[] = { 0x37f, 0x431, 0x71d, 0x25c, 0x719, 0x4d5, 0x4b6, 0x2ca, 0x26d, 0x64f, 0x46d };', '\t\tstatic unsigned int le13[] = { 0x5c5, 0xcc5, 0xb6b, 0x1bc5, 0x8b, 0x1782, 0x190, 0x15dd, 0x1af8, 0x75e, 0x4a1, 0xb4b, 0x1196 };', '\t\tunsigned int *le = (num_core == 1) ? le11 : le13;', '\t\tint set = mm (setIndex, le);', '', '\t\t// if this is a sampler set, access it', '', '\t\tif (set >= 0 && set < samp->nsampler_sets)', '\t\t\tsamp->access (tid, set, setIndex, tag, PC, accessType, paddr);', '', '\t\t// update default replacement policy (MDPP or PLRU)', '', '\t\tint *vector;', '\t\tstatic int vecmdpp[16] = { 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 0, 1, 0, 0 };', '\t\tstatic int vecplru[16] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };', '\t\tvector = dan_use_plru ? vecplru : vecmdpp;', '', '\t\t// do a fake promotion to see if this was a burst so we can get a prediction.', '', '\t\tif (dan_use_rrip) {', '\t\t\twas_burst = rrpv[setIndex][way] == 0;', '\t\t} else {', '\t\t\tupdate_plru_mdpp (setIndex, way, hit, vector, accessType, false);', '\t\t}', '', '\t\t// make the trace', '', '\t\tmake_trace (tid, samp->pred, setIndex, PC, tag, accessType, was_burst, !hit, lastmiss_bits[setIndex], paddr & 63);', '', '\t\t// get the next prediction for this block using that trace', '', '\t\tint conf = samp->pred->get_prediction (tid, setIndex);', '\t\tif (dan_use_rrip) {', '', '\t\t\t// what is the current RRPV value for this block?', '', '\t\t\tint position = rrpv[setIndex][way];', '\t\t\tif (!hit) {', '', '\t\t\t\t// on a placement, use the placement vector', '', '\t\t\t\tposition = dan_rrip_place_position;', '\t\t\t\tif (conf >= plv[2][0]) position = plv[2][1];', '\t\t\t\telse if (conf >= plv[1][0]) position = plv[1][1];', '\t\t\t\telse if (conf >= plv[0][0]) position = plv[0][1];', '\t\t\t} else {', '', '\t\t\t\t// on a hit, use the promotion threshold', '', '\t\t\t\tif (conf < dan_promotion_threshold)', '\t\t\t\t\tposition = 0;', '\t\t\t}', '', '\t\t\t// assign the new RRPV', '', '\t\t\trrpv[setIndex][way] = position;', '\t\t} else {', '', '\t\t\t// MDPP/PLRU replacement', '', '\t\t\tupdate_plru_mdpp (setIndex, way, hit, vector, accessType, true, conf);', '\t\t}', '\t}', 'stuff:', '\t// update address path', '', '\tbool record = false;', '\tif (accessType == LOAD) if (dan_record_types & 1) record = true;', '\tif (accessType == RFO) if (dan_record_types & 2) record = true;', '\tif (accessType == WRITEBACK) if (dan_record_types & 8) record = true;', '\tif (accessType == PREFETCH) if (dan_record_types & 16) record = true;', '\tif (record) {', '\t\tmemmove (&addresses[tid][1], &addresses[tid][0], (MAX_PATH_LENGTH-1) * sizeof (unsigned int));', '\t\taddresses[tid][0] = PC;', '\t}', '\tlastmiss_bits[setIndex] = !hit;', '}']
+Return type: void
+parsing function
+ - tid : int
+ - setIndex : int
+ - current_set : const int *
+ - assoc : int
+ - PC : int
+ - paddr : int
+ - accessType : int
+Body lines: ['int find_victim ( uint32_t tid, uint32_t setIndex, const BLOCK *current_set, uint32_t assoc, uint64_t PC, uint64_t paddr, uint32_t accessType) {', '', '\t// select a victim using default pseudo LRU policy', '', '\tassert (setIndex < llc_sets);', '\tint r;', '\tif (dan_use_rrip) {', 'startover:', '\t\tint lrus[LLC_WAYS], n = 0;', '\t\tfor (unsigned int wayID=0; wayID<assoc; wayID++) {', '\t\t\tif (rrpv[setIndex][wayID] == 3) lrus[n++] = wayID;', '\t\t}', '\t\tif (n) {', '\t\t\tr = lrus[rand()%n];', '\t\t} else {', '\t\t\tfor (unsigned int wayID=0; wayID<assoc; wayID++) rrpv[setIndex][wayID]++;', '\t\t\tgoto startover;', '\t\t}', '\t} else {', '\t\tr = get_mdpp_plru_victim (setIndex);', '\t}', '\t// we now have a victim, r; predict whether this block is', '\t// "dead on arrival" and bypass for non-writeback accesses', '', '\tif (accessType != WRITEBACK) {', '\t\tuint32_t tag = paddr / (llc_sets * 64);', '\t\tmake_trace (tid, samp->pred, setIndex, PC, tag, accessType, false, true, lastmiss_bits[setIndex], paddr & 63);', '\t\tint prediction;', '\t\tint conf = samp->pred->get_prediction (tid, setIndex);', '\t\tif (dan_dt2) {', '\t\t\tif (setIndex < leaders1) ', '\t\t\t\tprediction = conf >= dan_dt1;', '\t\t\telse if (setIndex < leaders2)', '\t\t\t\tprediction = conf >= dan_dt2;', '\t\t\telse {', '\t\t\t\tif (psel >= 0)', '\t\t\t\t\tprediction = conf >= dan_dt2;', '\t\t\t\telse', '\t\t\t\t\tprediction = conf >= dan_dt1;', '\t\t\t}', '\t\t} else {', '\t\t\tprediction = conf >= dan_bypass_threshold;', '\t\t}', '\t', '\t\t// if block is predicted dead, then it should bypass the cache', '\t', '\t\tif (prediction) {', '\t\t\tr = LLC_WAYS; // means bypass', '\t\t}', '\t}', '', '\t// return the selected victim', '', '\treturn r;', '}']
+Return type: int
+parsing function
+ - tid : int
+ - set : int
+ - real_set : int
+ - tag : int
+ - PC : int
+ - accessType : int
+ - paddr : int
+Body lines: ['void sdbp_sampler::access (uint32_t tid, int set, int real_set, uint64_t tag, uint64_t PC, int accessType, uint64_t paddr) {', '', "\t// get a pointer to this set's sampler entries", '', '\tsdbp_sampler_entry *blocks = &sets[set].blocks[0];', '', '\t// get a partial tag to search for', '', '\tunsigned int partial_tag = tag & ((1<<dan_sampler_tag_bits)-1);', '', '\t// this will be the way of the sampler entry we end up hitting or replacing', '', '\tint i;', '', '\t// search for a matching tag', '', '\t// no valid bits; tags are initialized to 0, and if we accidentally', "\t// match a 0 that's OK because we don't need correctness", '', '\tfor (i=0; i<dan_sampler_assoc; i++) if (blocks[i].tag == partial_tag) {', '', '\t\t// we know this block is not dead; inform the predictor', '', '\t\tpred->block_is_dead (tid, &blocks[i], blocks[i].trace_buffer, false, blocks[i].conf, blocks[i].lru_stack_position);', '\t\tbreak;', '\t}', '', '\t// did we find a match?', '', '\tbool is_fill = false;', '', '\tif (i == dan_sampler_assoc) {', '', '\t\t// find the LRU block', '', '\t\tif (i == dan_sampler_assoc) {', '\t\t\tint j;', '\t\t\tfor (j=0; j<dan_sampler_assoc; j++)', '\t\t\t\tif (blocks[j].lru_stack_position == (unsigned int) (dan_sampler_assoc-1)) break;', '\t\t\tassert (j < dan_sampler_assoc);', '\t\t\ti = j;', '\t\t}', '', '\t\t// previous trace leads to block being dead; inform the predictor', '', '\t\tpred->block_is_dead (tid, &blocks[i], blocks[i].trace_buffer, true, blocks[i].conf, dan_sampler_assoc);', '', "\t\t// reminds us to fill the block later (after we're done", "\t\t// using the current victim's metadata)", '', '\t\tis_fill = true;', '\t}', '', '\t// now the replaced or hit entry should be moved to the MRU position', '', '\tunsigned int position = blocks[i].lru_stack_position;', '\tfor(int way=0; way<dan_sampler_assoc; way++) {', '\t\tif (blocks[way].lru_stack_position < position) {', '\t\t\tblocks[way].lru_stack_position++;', '\t\t\t// inform the predictor that this block has reached', '\t\t\t// this position', '\t\t\tpred->block_is_dead (tid, &blocks[way], blocks[way].trace_buffer, true, blocks[way].conf, blocks[way].lru_stack_position);', '\t\t}', '\t}', '\tblocks[i].lru_stack_position = 0;', '', '\tif (is_fill) {', '\t\t// fill the victim block', '', '\t\tblocks[i].tag = partial_tag;', '\t}', '', '\t// record the trace', '', '\tmake_trace (tid, pred, real_set, PC, tag, accessType, position == 0, is_fill, lastmiss_bits[real_set], paddr & 63);', '\tmemcpy (blocks[i].trace_buffer, trace_buffer, (MAX_PATH_LENGTH+1) * sizeof (unsigned int));', '', '\t// get the next prediction for this entry', '', '\tblocks[i].conf = pred->get_prediction (tid, -1);', '}']
+Return type: void
+parsing function
+ - tid : int
+ - block : sdbp_sampler_entry *
+ - trace_buffer : unsigned int *
+ - d : bool
+ - conf : int
+ - pos : int
+Body lines: ['void perceptron_predictor::block_is_dead (uint32_t tid, sdbp_sampler_entry *block, unsigned int *trace_buffer, bool d, int conf, int pos) {', '', '\tbool prediction = conf >= dan_threshold;', '\tbool correct = prediction == d;', '', "\t// perceptron learning rule: don't train if the prediction is", '\t// correct and the confidence is greater than some theta', '', '\tbool do_train = false;', '\tif (conf < 0) {', '\t\tif (conf > -dan_theta2) do_train = true;', '\t} else {', '\t\tif (conf < dan_theta) do_train = true;', '\t}', '\tif (!correct) do_train = true;', '\tif (!do_train) return;', '', '\tfor (int i=0; i<dan_predictor_tables; i++) {', '\t\t// for a "dead" block, only train wrt the associativity', '\t\t// for this feature', '', '\t\tif (d) if (specs[i].assoc != pos) continue;', '', '\t\t// for a "live" block, only train if it would have been a hit not a placement', '', '\t\tif (!d) if (specs[i].assoc <= pos) continue;', '', '\t\t// ...get a pointer to the corresponding entry in that table', '', '\t\t//int *c = &tables[i][trace_buffer[i] & ((1<<dan_predictor_index_bits)-1)];', '\t\tint *c = &tables[i][trace_buffer[i] % table_sizes[i]];', '', '\t\t// if the block is dead, increment the counter', '', '\t\tif (d) {', '\t\t\tif (*c < dan_counter_max) (*c)++;', '\t\t} else {', '\t\t\tif (*c > dan_counter_min) (*c)--;', '\t\t}', '\t}', '}']
+Return type: void
+parsing function
+ - tid : int
+ - set : int
+Body lines: ['int perceptron_predictor::get_prediction (uint32_t tid, int set) {', '', '\t// start the confidence sum as 0', '', '\tint conf = 0;', '', '\t// for each table...', '\tfor (int i=0; i<dan_predictor_tables; i++) {', '', '\t\t// ...get the counter value for that table...', '', '\t\t//int val = tables[i][trace_buffer[i] & ((1<<dan_predictor_index_bits)-1)];', '\t\tint val = tables[i][trace_buffer[i] % table_sizes[i]];', '', '\t\t// and add it to the running total', '', '\t\tconf += val;', '\t}', '', '\t// if the counter is at least the threshold, the block is predicted dead', '', '\t// keep stored confidence to 9 bits', '\tif (conf > 255) conf = 255;', '\tif (conf < -256) conf = -256;', '\treturn conf;', '}']
+Return type: int
+parsing function
+file funsearch/implementation/starting_policies/lime.cc
+source code:
+////////////////////////////////////////////
+//                                        //
+//        LIME replacement policy         //
+//                                        //
+////////////////////////////////////////////
+
+#include "../inc/champsim_crc2.h"
+//#include "BloomFilter.h"
+#include <set>
+#include <vector>
+#include <array>
+#include <cstdint>
+#include <string>
+
+using namespace std;
+
+/************MurmurHash3_x64_128********************/
+#define ROTL64(x,y) rotl64(x,y)
+
+inline uint64_t rotl64 ( uint64_t x, int8_t r )
+{
+  return (x << r) | (x >> (64 - r));
+}   
+
+inline uint64_t getblock ( const uint64_t * p, int i )
+{
+  return p[i];
+}
+
+inline uint64_t fmix64 ( uint64_t k )
+{
+  k ^= k >> 33;
+  k *= 0xff51afd7ed558ccd;
+  k ^= k >> 33;
+  k *= 0xc4ceb9fe1a85ec53;
+  k ^= k >> 33;
+
+  return k;
+}
+
+void MurmurHash3_x64_128 ( const void * key, const int len,
+                           const uint32_t seed, void * out )
+{
+  const uint8_t * data = (const uint8_t*)key;
+  const int nblocks = len / 16;                                                  
+  int i;
+
+  uint64_t h1 = seed;
+  uint64_t h2 = seed;
+
+  uint64_t c1 = 0x87c37b91114253d5; //big constant
+  uint64_t c2 = 0x4cf5ad432745937f; //big constant
+
+  const uint64_t * blocks = (const uint64_t *)(data);
+
+  for(i = 0; i < nblocks; i++)
+  {
+    uint64_t k1 = getblock(blocks,i*2+0);
+    uint64_t k2 = getblock(blocks,i*2+1);
+    
+    k1 *= c1; k1  = ROTL64(k1,31); k1 *= c2; h1 ^= k1;
+    
+    h1 = ROTL64(h1,27); h1 += h2; h1 = h1*5+0x52dce729;
+    
+    k2 *= c2; k2  = ROTL64(k2,33); k2 *= c1; h2 ^= k2;
+    
+    h2 = ROTL64(h2,31); h2 += h1; h2 = h2*5+0x38495ab5;
+  }
+
+  const uint8_t * tail = (const uint8_t*)(data + nblocks*16);
+
+  uint64_t k1 = 0;
+  uint64_t k2 = 0;
+
+  switch(len & 15)
+  {
+  case 15: k2 ^= (uint64_t)(tail[14]) << 48;
+  case 14: k2 ^= (uint64_t)(tail[13]) << 40;
+  case 13: k2 ^= (uint64_t)(tail[12]) << 32;
+  case 12: k2 ^= (uint64_t)(tail[11]) << 24;
+  case 11: k2 ^= (uint64_t)(tail[10]) << 16;
+  case 10: k2 ^= (uint64_t)(tail[ 9]) << 8;
+  case  9: k2 ^= (uint64_t)(tail[ 8]) << 0;
+           k2 *= c2; k2  = ROTL64(k2,33); k2 *= c1; h2 ^= k2;
+
+  case  8: k1 ^= (uint64_t)(tail[ 7]) << 56;
+  case  7: k1 ^= (uint64_t)(tail[ 6]) << 48;
+  case  6: k1 ^= (uint64_t)(tail[ 5]) << 40;
+  case  5: k1 ^= (uint64_t)(tail[ 4]) << 32;
+  case  4: k1 ^= (uint64_t)(tail[ 3]) << 24;
+  case  3: k1 ^= (uint64_t)(tail[ 2]) << 16;
+  case  2: k1 ^= (uint64_t)(tail[ 1]) << 8;
+  case  1: k1 ^= (uint64_t)(tail[ 0]) << 0;
+           k1 *= c1; k1  = ROTL64(k1,31); k1 *= c2; h1 ^= k1;
+  };
+
+  h1 ^= len; h2 ^= len;
+
+  h1 += h2;
+  h2 += h1;
+
+  h1 = fmix64(h1);
+  h2 = fmix64(h2);
+
+  h1 += h2;
+  h2 += h1;
+
+  ((uint64_t*)out)[0] = h1;
+  ((uint64_t*)out)[1] = h2;
+}
+
+
+/*********BloomFilter********************/
+class BloomFilter {
+public:
+  BloomFilter();
+  BloomFilter(uint64_t size, uint8_t numHashes);
+  void add(uint64_t data);
+//  static BloomFilter merge(BloomFilter b1, BloomFilter b2);
+  bool possiblyContains(uint64_t data) const;
+  void clear();
+  uint8_t getCount();
+
+  uint64_t getSize();
+//  uint8_t getNumHashes();
+//  void setSize(uint64_t s);
+//  void setNumHashes(uint8_t n);
+//  uint64_t getValue();
+//  void setValue(uint64_t value);
+//  std::string toString();
+
+private:
+  uint8_t m_numHashes;
+  uint8_t count;
+  std::vector<bool> m_bits;
+};
+
+BloomFilter::BloomFilter()
+      : m_numHashes(6)
+      , m_bits(std::vector<bool>(1107, false))
+{
+ 
+}
+
+BloomFilter::BloomFilter(uint64_t size, uint8_t numHashes)
+      : m_numHashes(numHashes)
+      , m_bits(std::vector<bool>(size, false))
+{
+    count = 0;
+}
+
+std::array<uint64_t,2> hashbf(const uint8_t *data, std::size_t len)
+{
+  std::array<uint64_t, 2> hashValue {0, 0};
+  MurmurHash3_x64_128(data, len, 0, hashValue.data());
+  return hashValue;
+}
+
+inline uint64_t nthHash(uint8_t n, uint64_t hashA, uint64_t hashB, uint64_t filterSize) 
+{
+    return (hashA + n * hashB) % filterSize;
+}
+
+void BloomFilter::add(uint64_t data) 
+{
+  std::array<uint8_t, 8> data_array {0, 0, 0, 0, 0, 0, 0, 0};
+  for(int i = 0; i < 8; i++) {
+    data_array[i] = ((data >> (i*8)) & 0x00FF);
+  }
+  auto hashValues = hashbf(data_array.data(), 8);
+
+  for (int n = 0; n < m_numHashes; n++) 
+  {
+      m_bits[nthHash(n, hashValues[0], hashValues[1], m_bits.size())] = true;
+  }
+  count++;
+}  
+
+bool BloomFilter::possiblyContains(uint64_t data) const 
+{
+  std::array<uint8_t, 8> data_array {0, 0, 0, 0, 0, 0, 0, 0};
+  for(int i = 0; i < 8; i++) {
+    data_array[i] = ((data >> (i*8)) & 0x00FF);
+  }
+  auto hashValues = hashbf(data_array.data(), 8);
+
+  for (int n = 0; n < m_numHashes; n++) 
+  {
+      if (!m_bits[nthHash(n, hashValues[0], hashValues[1], m_bits.size())]) 
+      {
+          return false;
+      }
+  }
+
+  return true;
+}
+
+void BloomFilter::clear()
+{
+    count = 0;
+    for (uint64_t i=0; i<m_bits.size();i++ )
+        m_bits[i] = false;
+}
+
+uint8_t BloomFilter::getCount()
+{
+    return count;
+}
+
+uint64_t BloomFilter::getSize()
+{
+    return m_bits.size();
+}
+
+/******************LIME*******************/
+
+int NUM_CORE; 
+int LLC_SETS ;
+int LLC_SETS_LOG2 ;
+#define LLC_WAYS 16
+#define maxRRPV 7
+
+//Load/Store instruction category
+#define RANDOM 0
+#define STREAMING 1
+#define THRASH 2
+#define FRIENDLY 3
+
+//
+#define SAMPLE_COUNT 128 // LLC_WAYS<<3 
+#define OV_size 128
+int ALIAS_TAB_SIZE;
+
+uint32_t rrpv[8192][LLC_WAYS];
+uint64_t cold_misses;
+vector<vector<uint32_t>> ov;
+vector<vector<bool>> hv;
+uint32_t id[8192];
+vector<vector<pair<uint64_t, uint64_t>>> history;
+
+BloomFilter** data_filter;
+set<int> sample_set;
+BloomFilter* pc_friendly_filter;
+BloomFilter* pc_streaming_filter;
+vector<pair<uint64_t,bool>> alias_table;
+// initialize replacement state
+void InitReplacementState()
+{
+    int cfg = get_config_number();
+    if(cfg==1 || cfg==2){
+        NUM_CORE=1;
+        LLC_SETS  = NUM_CORE*2048;
+        LLC_SETS_LOG2 = 11;
+        ALIAS_TAB_SIZE = NUM_CORE*64 ;
+    }
+    else if(cfg == 3 || cfg == 4){
+        NUM_CORE=4;
+        LLC_SETS  = NUM_CORE*2048;
+        LLC_SETS_LOG2 = 13;
+        ALIAS_TAB_SIZE = NUM_CORE*64 ;
+    
+    }
+
+    for (int i=0; i<LLC_SETS; i++) {
+        for (int j=0; j<LLC_WAYS; j++) {
+            rrpv[i][j] = maxRRPV;
+        }
+    }
+    
+    pc_friendly_filter = new BloomFilter(4096, 6);
+    pc_streaming_filter = new BloomFilter(4096, 6);
+
+
+    int sample_sets_num = 20*NUM_CORE;
+    if(cfg==1 || cfg == 2){
+        int random_number[20]={46, 102, 257, 406, 510, 630, 772, 880, 981, 1088, 1163, 1206, 1311, 1436, 1543, 1644, 1735, 1810, 1956, 2017};
+        for(int i=0; i<sample_sets_num; i++){
+            sample_set.insert(random_number[i]);
+        }
+    }
+    else if(cfg==3 || cfg==4){
+        int random_number[80]={187, 201, 286, 332, 449, 642, 675, 682, 744, 770, 883, 1013, 1085, 1227, 1237, 1298, 1310, 1333, 1358, 1671, 1728, 1812, 1819, 1963, 2295, 2410, 2450, 2508, 2553, 2592, 2700, 2976, 3084, 3359, 3557, 3780, 3879, 4303, 4328, 4397, 4428, 4514, 4561, 4852, 4897, 4943, 5000, 5187, 5314, 5361, 5532, 5535, 5635, 5646, 5718, 5853, 5898, 5917, 6056, 6164, 6340, 6435, 6827, 6839, 6852, 6944, 7174, 7466, 7494, 7496, 7497, 7519, 7524, 7604, 7638, 7788, 7830, 8152, 8158, 8173};
+        for(int i=0; i<sample_sets_num; i++){
+            sample_set.insert(random_number[i]);
+        }
+    }
+
+    for (int i=0; i<LLC_SETS; i++) {
+        std::vector<uint32_t> init;
+        ov.push_back(init);
+        std::vector<bool> init2;
+        hv.push_back(init2);
+    }
+    
+    for (int i=0; i<LLC_SETS; i++){
+        std::vector<pair<uint64_t, uint64_t>> init;
+        history.push_back(init);
+    }
+
+    for (int i=0; i<LLC_SETS; i++) {
+        id[i] = 0;
+    }
+
+}
+
+uint32_t hash18(uint64_t pc)
+{
+    uint16_t pc0 = pc & 0xffff;
+    uint8_t bit32 = (pc & 0x100000000) >> 32;
+    uint8_t bit40 = (pc & 0x10000000000) >> 40;
+    uint16_t hash = pc0 + (bit40 <<18) + (bit32<<17) ;    
+    return hash;
+}
+
+uint64_t hash37(uint64_t tag_addr)
+{
+    uint64_t top8 = (tag_addr<<(6+LLC_SETS_LOG2)) >> 56;
+    uint64_t hash = (top8<<29) + (tag_addr&0x1fffffff);
+    return hash;
+}
+
+int getPCCategory(uint64_t pc)
+{
+    uint32_t target = hash18(pc); //hash1 return 16 bit
+    bool friendly = pc_friendly_filter -> possiblyContains(target); 
+    bool streaming = pc_streaming_filter -> possiblyContains(target); 
+    if(friendly && streaming){
+        vector<pair<uint64_t,bool>>::iterator it;
+        for(it=alias_table.begin(); it!=alias_table.end(); it++){
+            if((*it).first == target){
+                if((*it).second==true)
+                    return FRIENDLY;
+                else
+                    return STREAMING;
+            }
+        }
+        //put target into alias_table
+        if(alias_table.size()>ALIAS_TAB_SIZE){
+            alias_table.erase(alias_table.begin());
+        }
+        pair<uint64_t,bool> alias_pc(target,true);
+        alias_table.push_back(alias_pc);
+        return FRIENDLY;
+    }
+        //return THRASH;
+    else if (friendly)
+        return FRIENDLY;
+    else if (streaming)
+        return STREAMING;
+    else 
+        return RANDOM;
+}
+
+void updatePCCategory(uint32_t pc, int new_cate)
+{
+    if (new_cate == FRIENDLY)
+        pc_friendly_filter -> add(pc);
+    else if (new_cate == STREAMING)
+        pc_streaming_filter -> add(pc);
+   
+    vector<pair<uint64_t,bool>>::iterator it; 
+    for(it=alias_table.begin(); it!=alias_table.end(); it++){
+        if((*it).first == pc){
+            if (new_cate == FRIENDLY)
+                (*it).second=true;
+            if (new_cate == STREAMING)
+                (*it).second=false;
+        }
+    }
+    return;
+}
+
+// find replacement victim
+// return value should be 0 ~ 15 or 16 (bypass)
+uint32_t find_victim (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)
+{
+    if(type == 3)
+        return 0;
+
+    if(type == 2)
+        return LLC_WAYS;
+
+    if(getPCCategory(PC) == STREAMING && type!=3){
+        return LLC_WAYS;
+    }
+
+    // look for the maxRRPV line
+    while (1)
+    {
+        for (int i=0; i<LLC_WAYS; i++)
+            if (rrpv[set][i] == maxRRPV){
+                return i;
+            }
+
+        for (int i=0; i<LLC_WAYS; i++)
+            rrpv[set][i]++;
+    }
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+
+}
+
+// called on every cache hit and cache fill
+void UpdateReplacementState (uint32_t cpu, uint32_t set, uint32_t way, uint64_t paddr, uint64_t PC, uint64_t victim_addr, uint32_t type, uint8_t hit)
+{
+    if(type==3 || type==2) // do not train on writeback or prefetch
+        return; 
+    if(sample_set.find(set) != sample_set.end()){
+/*
+        if(set == 46)
+            cout << "cfg 1/2" << endl;
+        if(set == 7494)
+            cout << "cfg 3/4" << endl;
+*/
+        uint64_t tag_addr = paddr >> (6 + LLC_SETS_LOG2);
+            // ---- Update History
+        if (history[set].size() >= OV_size) {
+            if(hv[set][0] == false){
+                int new_cate = 1; //STREAMING
+                uint64_t ori_pc = history[set][0].second;
+                updatePCCategory(ori_pc, new_cate);
+            }
+            history[set].erase( history[set].begin());
+            ov[set].erase(ov[set].begin());
+            hv[set].erase(hv[set].begin());
+            id[set] --;
+        } 
+
+
+        // ---- Update OV HV
+        pair<uint64_t, uint64_t> paddr_PC (hash37(tag_addr), hash18(PC));
+        history[set].push_back(paddr_PC);
+        ov[set].push_back(0);
+        hv[set].push_back(false);
+
+        int end = id[set];
+        int start = -1;
+        for (int i = end-1; i >=0; i--){
+            if (history[set][i].first == paddr_PC.first){
+                start = i;
+                break;
+            }
+        }
+        id[set] ++;
+        if (start >= 0){
+            bool keep = true;
+            for(int i=start; i<end; i++){
+                keep = keep && (ov[set][i]<LLC_WAYS-1);
+                if(!keep)
+                    break;
+            }
+            uint64_t ori_pc = history[set][start].second;
+            int new_cate;
+            if(keep){
+                hv[set][start] = true;
+                for (int i=start; i < end; i++)
+                    ov[set][i] += 1;
+                new_cate = FRIENDLY; //FRIENDLY
+                updatePCCategory(ori_pc, new_cate);
+            }else{
+                new_cate = STREAMING; //STREAMING
+                updatePCCategory(ori_pc, new_cate);
+            }
+        }
+    }
+
+    if(way == LLC_WAYS){
+        return; 
+    }
+    int category = getPCCategory(PC);
+
+    if(hit == 1){
+        switch(category){
+            case RANDOM:
+                if(rrpv[set][way] >  (maxRRPV-4))
+                    rrpv[set][way] = maxRRPV-4;
+                break;
+            case STREAMING:
+                rrpv[set][way] = maxRRPV-4;
+                break;
+            case THRASH:
+            case FRIENDLY:
+                rrpv[set][way] = 0;
+                break;
+        }
+    }
+    else{
+        switch(category){
+            case RANDOM:
+                rrpv[set][way] = maxRRPV-1;
+                break;
+            case STREAMING:
+                rrpv[set][way] = maxRRPV-1;
+                break;
+            case THRASH:
+            case FRIENDLY:
+                rrpv[set][way] = 0;
+                for(uint64_t i=0; i< LLC_WAYS; i++){
+                    if(i != way && (rrpv[set][i] < 6))
+                        rrpv[set][i]+=1;
+                }
+                break;
+        }
+
+    }
+    return; 
+}
+
+// use this function to print out your own stats on every heartbeat 
+void PrintStats_Heartbeat()
+{
+
+}
+
+// use this function to print out your own stats at the end of simulation
+void PrintStats()
+{
+}
+
+
+parsing function
+Body lines: ['', '    for (int i=0; i<LLC_SETS; i++) {', '        id[i] = 0;', '    }', '']
+Return type: int
+parsing function
+ - __threadid : __gthread_t *
+ - __func : void *(*)(void *)
+ - __args : void *
+Body lines: []
+Return type: int
+parsing function
+ - __threadid : __gthread_t
+ - __value_ptr : void **
+Body lines: []
+Return type: int
+parsing function
+ - __threadid : __gthread_t
+Body lines: []
+Return type: int
+parsing function
+ - __t1 : __gthread_t
+ - __t2 : __gthread_t
+Body lines: []
+Return type: int
+parsing function
+Body lines: []
+Return type: __gthread_t
+parsing function
+Body lines: []
+Return type: int
+parsing function
+ - __once : __gthread_once_t *
+ - __func : void (*)()
+Body lines: []
+Return type: int
+parsing function
+ - __key : __gthread_key_t *
+ - __dtor : void (*)(void *)
+Body lines: []
+Return type: int
+parsing function
+ - __key : __gthread_key_t
+Body lines: []
+Return type: int
+parsing function
+ - __key : __gthread_key_t
+Body lines: []
+Return type: void *
+parsing function
+ - __key : __gthread_key_t
+ - __ptr : const void *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: void
+parsing function
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_mutex_t *
+ - __abs_timeout : const __gthread_time_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_recursive_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_recursive_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_recursive_mutex_t *
+ - __abs_timeout : const __gthread_time_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_recursive_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __mutex : __gthread_recursive_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+ - __mutex : __gthread_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+ - __mutex : __gthread_mutex_t *
+ - __abs_timeout : const __gthread_time_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+ - __mutex : __gthread_recursive_mutex_t *
+Body lines: []
+Return type: int
+parsing function
+ - __cond : __gthread_cond_t *
+Body lines: []
+Return type: int
+parsing function
+ - x : uint64_t
+ - r : int8_t
+Body lines: ['inline uint64_t rotl64 ( uint64_t x, int8_t r )', '{', '  return (x << r) | (x >> (64 - r));', '}   ']
+Return type: uint64_t
+parsing function
+ - p : const uint64_t *
+ - i : int
+Body lines: ['inline uint64_t getblock ( const uint64_t * p, int i )', '{', '  return p[i];', '}']
+Return type: uint64_t
+parsing function
+ - k : uint64_t
+Body lines: ['inline uint64_t fmix64 ( uint64_t k )', '{', '  k ^= k >> 33;', '  k *= 0xff51afd7ed558ccd;', '  k ^= k >> 33;', '  k *= 0xc4ceb9fe1a85ec53;', '  k ^= k >> 33;', '', '  return k;', '}']
+Return type: uint64_t
+parsing function
+ - key : const void *
+ - len : const int
+ - seed : const uint32_t
+ - out : void *
+Body lines: ['void MurmurHash3_x64_128 ( const void * key, const int len,', '                           const uint32_t seed, void * out )', '{', '  const uint8_t * data = (const uint8_t*)key;', '  const int nblocks = len / 16;                                                  ', '  int i;', '', '  uint64_t h1 = seed;', '  uint64_t h2 = seed;', '', '  uint64_t c1 = 0x87c37b91114253d5; //big constant', '  uint64_t c2 = 0x4cf5ad432745937f; //big constant', '', '  const uint64_t * blocks = (const uint64_t *)(data);', '', '  for(i = 0; i < nblocks; i++)', '  {', '    uint64_t k1 = getblock(blocks,i*2+0);', '    uint64_t k2 = getblock(blocks,i*2+1);', '    ', '    k1 *= c1; k1  = ROTL64(k1,31); k1 *= c2; h1 ^= k1;', '    ', '    h1 = ROTL64(h1,27); h1 += h2; h1 = h1*5+0x52dce729;', '    ', '    k2 *= c2; k2  = ROTL64(k2,33); k2 *= c1; h2 ^= k2;', '    ', '    h2 = ROTL64(h2,31); h2 += h1; h2 = h2*5+0x38495ab5;', '  }', '', '  const uint8_t * tail = (const uint8_t*)(data + nblocks*16);', '', '  uint64_t k1 = 0;', '  uint64_t k2 = 0;', '', '  switch(len & 15)', '  {', '  case 15: k2 ^= (uint64_t)(tail[14]) << 48;', '  case 14: k2 ^= (uint64_t)(tail[13]) << 40;', '  case 13: k2 ^= (uint64_t)(tail[12]) << 32;', '  case 12: k2 ^= (uint64_t)(tail[11]) << 24;', '  case 11: k2 ^= (uint64_t)(tail[10]) << 16;', '  case 10: k2 ^= (uint64_t)(tail[ 9]) << 8;', '  case  9: k2 ^= (uint64_t)(tail[ 8]) << 0;', '           k2 *= c2; k2  = ROTL64(k2,33); k2 *= c1; h2 ^= k2;', '', '  case  8: k1 ^= (uint64_t)(tail[ 7]) << 56;', '  case  7: k1 ^= (uint64_t)(tail[ 6]) << 48;', '  case  6: k1 ^= (uint64_t)(tail[ 5]) << 40;', '  case  5: k1 ^= (uint64_t)(tail[ 4]) << 32;', '  case  4: k1 ^= (uint64_t)(tail[ 3]) << 24;', '  case  3: k1 ^= (uint64_t)(tail[ 2]) << 16;', '  case  2: k1 ^= (uint64_t)(tail[ 1]) << 8;', '  case  1: k1 ^= (uint64_t)(tail[ 0]) << 0;', '           k1 *= c1; k1  = ROTL64(k1,31); k1 *= c2; h1 ^= k1;', '  };', '', '  h1 ^= len; h2 ^= len;', '', '  h1 += h2;', '  h2 += h1;', '', '  h1 = fmix64(h1);', '  h2 = fmix64(h2);', '', '  h1 += h2;', '  h2 += h1;', '', '  ((uint64_t*)out)[0] = h1;', '  ((uint64_t*)out)[1] = h2;', '}']
+Return type: void
+parsing function
+ - data : const uint8_t *
+ - len : std::size_t
+Body lines: ['std::array<uint64_t,2> hashbf(const uint8_t *data, std::size_t len)', '{', '  std::array<uint64_t, 2> hashValue {0, 0};', '  MurmurHash3_x64_128(data, len, 0, hashValue.data());', '  return hashValue;', '}']
+Return type: std::array<uint64_t, 2>
+parsing function
+ - n : uint8_t
+ - hashA : uint64_t
+ - hashB : uint64_t
+ - filterSize : uint64_t
+Body lines: ['inline uint64_t nthHash(uint8_t n, uint64_t hashA, uint64_t hashB, uint64_t filterSize) ', '{', '    return (hashA + n * hashB) % filterSize;', '}']
+Return type: uint64_t
+parsing function
+ - data : uint64_t
+Body lines: ['void BloomFilter::add(uint64_t data) ', '{', '  std::array<uint8_t, 8> data_array {0, 0, 0, 0, 0, 0, 0, 0};', '  for(int i = 0; i < 8; i++) {', '    data_array[i] = ((data >> (i*8)) & 0x00FF);', '  }', '  auto hashValues = hashbf(data_array.data(), 8);', '', '  for (int n = 0; n < m_numHashes; n++) ', '  {', '      m_bits[nthHash(n, hashValues[0], hashValues[1], m_bits.size())] = true;', '  }', '  count++;', '}  ']
+Return type: void
+parsing function
+ - data : uint64_t
+Body lines: ['bool BloomFilter::possiblyContains(uint64_t data) const ', '{', '  std::array<uint8_t, 8> data_array {0, 0, 0, 0, 0, 0, 0, 0};', '  for(int i = 0; i < 8; i++) {', '    data_array[i] = ((data >> (i*8)) & 0x00FF);', '  }', '  auto hashValues = hashbf(data_array.data(), 8);', '', '  for (int n = 0; n < m_numHashes; n++) ', '  {', '      if (!m_bits[nthHash(n, hashValues[0], hashValues[1], m_bits.size())]) ', '      {', '          return false;', '      }', '  }', '', '  return true;', '}']
+Return type: bool
+parsing function
+Body lines: ['void BloomFilter::clear()', '{', '    count = 0;', '    for (uint64_t i=0; i<m_bits.size();i++ )', '        m_bits[i] = false;', '}']
+Return type: void
+parsing function
+Body lines: ['uint8_t BloomFilter::getCount()', '{', '    return count;', '}']
+Return type: uint8_t
+parsing function
+Body lines: ['uint64_t BloomFilter::getSize()', '{', '    return m_bits.size();', '}']
+Return type: uint64_t
+parsing function
+Body lines: ['void InitReplacementState()', '{', '    int cfg = get_config_number();', '    if(cfg==1 || cfg==2){', '        NUM_CORE=1;', '        LLC_SETS  = NUM_CORE*2048;', '        LLC_SETS_LOG2 = 11;', '        ALIAS_TAB_SIZE = NUM_CORE*64 ;', '    }', '    else if(cfg == 3 || cfg == 4){', '        NUM_CORE=4;', '        LLC_SETS  = NUM_CORE*2048;', '        LLC_SETS_LOG2 = 13;', '        ALIAS_TAB_SIZE = NUM_CORE*64 ;', '    ', '    }', '', '    for (int i=0; i<LLC_SETS; i++) {', '        for (int j=0; j<LLC_WAYS; j++) {', '            rrpv[i][j] = maxRRPV;', '        }', '    }', '    ', '    pc_friendly_filter = new BloomFilter(4096, 6);', '    pc_streaming_filter = new BloomFilter(4096, 6);', '', '', '    int sample_sets_num = 20*NUM_CORE;', '    if(cfg==1 || cfg == 2){', '        int random_number[20]={46, 102, 257, 406, 510, 630, 772, 880, 981, 1088, 1163, 1206, 1311, 1436, 1543, 1644, 1735, 1810, 1956, 2017};', '        for(int i=0; i<sample_sets_num; i++){', '            sample_set.insert(random_number[i]);', '        }', '    }', '    else if(cfg==3 || cfg==4){', '        int random_number[80]={187, 201, 286, 332, 449, 642, 675, 682, 744, 770, 883, 1013, 1085, 1227, 1237, 1298, 1310, 1333, 1358, 1671, 1728, 1812, 1819, 1963, 2295, 2410, 2450, 2508, 2553, 2592, 2700, 2976, 3084, 3359, 3557, 3780, 3879, 4303, 4328, 4397, 4428, 4514, 4561, 4852, 4897, 4943, 5000, 5187, 5314, 5361, 5532, 5535, 5635, 5646, 5718, 5853, 5898, 5917, 6056, 6164, 6340, 6435, 6827, 6839, 6852, 6944, 7174, 7466, 7494, 7496, 7497, 7519, 7524, 7604, 7638, 7788, 7830, 8152, 8158, 8173};', '        for(int i=0; i<sample_sets_num; i++){', '            sample_set.insert(random_number[i]);', '        }', '    }', '', '    for (int i=0; i<LLC_SETS; i++) {', '        std::vector<uint32_t> init;', '        ov.push_back(init);', '        std::vector<bool> init2;', '        hv.push_back(init2);', '    }', '    ', '    for (int i=0; i<LLC_SETS; i++){', '        std::vector<pair<uint64_t, uint64_t>> init;', '        history.push_back(init);', '    }', '', '    for (int i=0; i<LLC_SETS; i++) {', '        id[i] = 0;', '    }', '', '}']
+Return type: void
+parsing function
+ - pc : uint64_t
+Body lines: ['uint32_t hash18(uint64_t pc)', '{', '    uint16_t pc0 = pc & 0xffff;', '    uint8_t bit32 = (pc & 0x100000000) >> 32;', '    uint8_t bit40 = (pc & 0x10000000000) >> 40;', '    uint16_t hash = pc0 + (bit40 <<18) + (bit32<<17) ;    ', '    return hash;', '}']
+Return type: uint32_t
+parsing function
+ - tag_addr : uint64_t
+Body lines: ['uint64_t hash37(uint64_t tag_addr)', '{', '    uint64_t top8 = (tag_addr<<(6+LLC_SETS_LOG2)) >> 56;', '    uint64_t hash = (top8<<29) + (tag_addr&0x1fffffff);', '    return hash;', '}']
+Return type: uint64_t
+parsing function
+ - pc : uint64_t
+Body lines: ['int getPCCategory(uint64_t pc)', '{', '    uint32_t target = hash18(pc); //hash1 return 16 bit', '    bool friendly = pc_friendly_filter -> possiblyContains(target); ', '    bool streaming = pc_streaming_filter -> possiblyContains(target); ', '    if(friendly && streaming){', '        vector<pair<uint64_t,bool>>::iterator it;', '        for(it=alias_table.begin(); it!=alias_table.end(); it++){', '            if((*it).first == target){', '                if((*it).second==true)', '                    return FRIENDLY;', '                else', '                    return STREAMING;', '            }', '        }', '        //put target into alias_table', '        if(alias_table.size()>ALIAS_TAB_SIZE){', '            alias_table.erase(alias_table.begin());', '        }', '        pair<uint64_t,bool> alias_pc(target,true);', '        alias_table.push_back(alias_pc);', '        return FRIENDLY;', '    }', '        //return THRASH;', '    else if (friendly)', '        return FRIENDLY;', '    else if (streaming)', '        return STREAMING;', '    else ', '        return RANDOM;', '}']
+Return type: int
+parsing function
+ - pc : uint32_t
+ - new_cate : int
+Body lines: ['void updatePCCategory(uint32_t pc, int new_cate)', '{', '    if (new_cate == FRIENDLY)', '        pc_friendly_filter -> add(pc);', '    else if (new_cate == STREAMING)', '        pc_streaming_filter -> add(pc);', '   ', '    vector<pair<uint64_t,bool>>::iterator it; ', '    for(it=alias_table.begin(); it!=alias_table.end(); it++){', '        if((*it).first == pc){', '            if (new_cate == FRIENDLY)', '                (*it).second=true;', '            if (new_cate == STREAMING)', '                (*it).second=false;', '        }', '    }', '    return;', '}']
+Return type: void
+parsing function
+ - cpu : uint32_t
+ - set : uint32_t
+ - current_set : const int *
+ - PC : uint64_t
+ - paddr : uint64_t
+ - type : uint32_t
+Body lines: ['uint32_t find_victim (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)', '{', '    if(type == 3)', '        return 0;', '', '    if(type == 2)', '        return LLC_WAYS;', '', '    if(getPCCategory(PC) == STREAMING && type!=3){', '        return LLC_WAYS;', '    }', '', '    // look for the maxRRPV line', '    while (1)', '    {', '        for (int i=0; i<LLC_WAYS; i++)', '            if (rrpv[set][i] == maxRRPV){', '                return i;', '            }', '', '        for (int i=0; i<LLC_WAYS; i++)', '            rrpv[set][i]++;', '    }', '', '    // WE SHOULD NOT REACH HERE', '    assert(0);', '    return 0;', '', '}']
+Return type: uint32_t
+parsing function
+ - cpu : uint32_t
+ - set : uint32_t
+ - way : uint32_t
+ - paddr : uint64_t
+ - PC : uint64_t
+ - victim_addr : uint64_t
+ - type : uint32_t
+ - hit : uint8_t
+Body lines: ['void UpdateReplacementState (uint32_t cpu, uint32_t set, uint32_t way, uint64_t paddr, uint64_t PC, uint64_t victim_addr, uint32_t type, uint8_t hit)', '{', '    if(type==3 || type==2) // do not train on writeback or prefetch', '        return; ', '    if(sample_set.find(set) != sample_set.end()){', '/*', '        if(set == 46)', '            cout << "cfg 1/2" << endl;', '        if(set == 7494)', '            cout << "cfg 3/4" << endl;', '*/', '        uint64_t tag_addr = paddr >> (6 + LLC_SETS_LOG2);', '            // ---- Update History', '        if (history[set].size() >= OV_size) {', '            if(hv[set][0] == false){', '                int new_cate = 1; //STREAMING', '                uint64_t ori_pc = history[set][0].second;', '                updatePCCategory(ori_pc, new_cate);', '            }', '            history[set].erase( history[set].begin());', '            ov[set].erase(ov[set].begin());', '            hv[set].erase(hv[set].begin());', '            id[set] --;', '        } ', '', '', '        // ---- Update OV HV', '        pair<uint64_t, uint64_t> paddr_PC (hash37(tag_addr), hash18(PC));', '        history[set].push_back(paddr_PC);', '        ov[set].push_back(0);', '        hv[set].push_back(false);', '', '        int end = id[set];', '        int start = -1;', '        for (int i = end-1; i >=0; i--){', '            if (history[set][i].first == paddr_PC.first){', '                start = i;', '                break;', '            }', '        }', '        id[set] ++;', '        if (start >= 0){', '            bool keep = true;', '            for(int i=start; i<end; i++){', '                keep = keep && (ov[set][i]<LLC_WAYS-1);', '                if(!keep)', '                    break;', '            }', '            uint64_t ori_pc = history[set][start].second;', '            int new_cate;', '            if(keep){', '                hv[set][start] = true;', '                for (int i=start; i < end; i++)', '                    ov[set][i] += 1;', '                new_cate = FRIENDLY; //FRIENDLY', '                updatePCCategory(ori_pc, new_cate);', '            }else{', '                new_cate = STREAMING; //STREAMING', '                updatePCCategory(ori_pc, new_cate);', '            }', '        }', '    }', '', '    if(way == LLC_WAYS){', '        return; ', '    }', '    int category = getPCCategory(PC);', '', '    if(hit == 1){', '        switch(category){', '            case RANDOM:', '                if(rrpv[set][way] >  (maxRRPV-4))', '                    rrpv[set][way] = maxRRPV-4;', '                break;', '            case STREAMING:', '                rrpv[set][way] = maxRRPV-4;', '                break;', '            case THRASH:', '            case FRIENDLY:', '                rrpv[set][way] = 0;', '                break;', '        }', '    }', '    else{', '        switch(category){', '            case RANDOM:', '                rrpv[set][way] = maxRRPV-1;', '                break;', '            case STREAMING:', '                rrpv[set][way] = maxRRPV-1;', '                break;', '            case THRASH:', '            case FRIENDLY:', '                rrpv[set][way] = 0;', '                for(uint64_t i=0; i< LLC_WAYS; i++){', '                    if(i != way && (rrpv[set][i] < 6))', '                        rrpv[set][i]+=1;', '                }', '                break;', '        }', '', '    }', '    return; ', '}']
+Return type: void
+parsing function
+Body lines: ['void PrintStats_Heartbeat()', '{', '', '}']
+Return type: void
+parsing function
+Body lines: ['void PrintStats()', '{', '}']
+Return type: void
+parsing function
+Using cuda device
+PROMPT: 
+OUTPUTS
+tensor([[128000,   2374,     25,  ...,     35,   8648,  14505]])
+RESPONSE
+<|begin_of_text|>System: You are a code generation assistant. I need you to make a cache replacement policy for a cache simulator that maxmimzes the cache hit rate. Below I've provide some examples of policies and then a new policy for you to fill out with an improved version. Write out the C++ code for the new improved policy to improve on the existing policies. Only write one new policy in the function skeleton I provided for you at the end of the code. Code: Here are some candidate programs:
+
+Program 1:
+def find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const int * current_set, int ip, int full_addr, int type) -> long:
+long drrip::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
+                        champsim::address full_addr, access_type type)
+{
+  // look for the maxRRPV line
+  auto begin = std::next(std::begin(rrpv), set * NUM_WAY);
+  auto end = std::next(begin, NUM_WAY);
+
+  auto victim = std::max_element(begin, end);
+  if (auto rrpv_update = maxRRPV - *victim; rrpv_update!= 0)
+    for (auto it = begin; it!= end; ++it)
+      *it += rrpv_update;
+
+  assert(begin <= victim);
+  assert(victim < end);
+  return std::distance(begin, victim); // cast protected by assertions
+}
+
+
+
+Program 2:
+def find_victim(int cpu, int set, const int * current_set, int PC, int paddr, int type) -> int:
+uint32_t find_victim (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)
+{
+    // look for the maxRRPV line
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+        if (rrpv[set][i] == maxRRPV)
+            return i;
+
+    //If we cannot find a cache-averse line, we evict the oldest cache-friendly line
+    uint32_t max_rrip = 0;
+    int32_t lru_victim = -1;
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+    {
+        if (rrpv[set][i] >= max_rrip)
+        {
+            max_rrip = rrpv[set][i];
+            lru_victim = i;
+        }
+    }
+
+    assert (lru_victim!= -1);
+    //The predictor is trained negatively on LRU evictions
+    if( SAMPLED_SET(set) )
+    {
+        if(prefetched[set][lru_victim])
+            prefetch_predictor->decrement(signatures[set][lru_victim]);
+        else
+            demand_predictor->decrement(signatures[set][lru_victim]);
+    }
+    return lru_victim;
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+
+
+Program 3:
+def find_victim(int tid, int setIndex, const int * current_set, int assoc, int PC, int paddr, int accessType) -> int:
+int find_victim ( uint32_t tid, uint32_t setIndex, const BLOCK *current_set, uint32_t assoc, uint64_t PC, uint64_t paddr, uint32_t accessType) {
+
+	// select a victim using default pseudo LRU policy
+
+	assert (setIndex < llc_sets);
+	int r;
+	if (dan_use_rrip) {
+startover:
+		int lrus[LLC_WAYS], n = 0;
+		for (unsigned int wayID=0; wayID<assoc; wayID++) {
+			if (rrpv[setIndex][wayID] == 3) lrus[n++] = wayID;
+		}
+		if (n) {
+			r = lrus[rand()%n];
+		} else {
+			for (unsigned int wayID=0; wayID<assoc; wayID++) rrpv[setIndex][wayID]++;
+			goto startover;
+		}
+	} else {
+		r = get_mdpp_plru_victim (setIndex);
+	}
+	// we now have a victim, r; predict whether this block is
+	// "dead on arrival" and bypass for non-writeback accesses
+
+	if (accessType!= WRITEBACK) {
+		uint32_t tag = paddr / (llc_sets * 64);
+		make_trace (tid, samp->pred, setIndex, PC, tag, accessType, false, true, lastmiss_bits[setIndex], paddr & 63);
+		int prediction;
+		int conf = samp->pred->get_prediction (tid, setIndex);
+		if (dan_dt2) {
+			if (setIndex < leaders1) 
+				prediction = conf >= dan_dt1;
+			else if (setIndex < leaders2)
+				prediction = conf >= dan_dt2;
+			else {
+				if (psel >= 0)
+					prediction = conf >= dan_dt2;
+				else
+					prediction = conf >= dan_dt1;
+			}
+		} else {
+			prediction = conf >= dan_bypass_threshold;
+		}
+	
+		// if block is predicted dead, then it should bypass the cache
+	
+		if (prediction) {
+			r = LLC_WAYS; // means bypass
+		}
+	}
+
+	// return the selected victim
+
+	return r;
+}
+
+
+
+Using inspiration from the above, generate a new candidate program: 
+
+def find_victim(int cpu, int set, const int * current_set, int PC, int paddr, int type) -> int:
+uint32_t find_victim (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)
+{
+    // look for the maxRRPV line
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+        if (rrpv[set][i] == maxRRPV)
+            return i;
+
+    //If we cannot find a cache-averse line, we evict the oldest cache-friendly line
+    uint32_t max_rrip = 0;
+    int32_t lru_victim = -1;
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+    {
+        if (rrpv[set][i] >= max_rrip)
+        {
+            max_rrip = rrpv[set][i];
+            lru_victim = i;
+        }
+    }
+
+    assert (lru_victim!= -1);
+    //The predictor is trained negatively on LRU evictions
+    if( SAMPLED_SET(set
+BODY BEFORE TRIMMING
+<|begin_of_text|>System: You are a code generation assistant. I need you to make a cache replacement policy for a cache simulator that maxmimzes the cache hit rate. Below I've provide some examples of policies and then a new policy for you to fill out with an improved version. Write out the C++ code for the new improved policy to improve on the existing policies. Only write one new policy in the function skeleton I provided for you at the end of the code. Code: Here are some candidate programs:
+
+Program 1:
+def find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const int * current_set, int ip, int full_addr, int type) -> long:
+long drrip::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
+                        champsim::address full_addr, access_type type)
+{
+  // look for the maxRRPV line
+  auto begin = std::next(std::begin(rrpv), set * NUM_WAY);
+  auto end = std::next(begin, NUM_WAY);
+
+  auto victim = std::max_element(begin, end);
+  if (auto rrpv_update = maxRRPV - *victim; rrpv_update!= 0)
+    for (auto it = begin; it!= end; ++it)
+      *it += rrpv_update;
+
+  assert(begin <= victim);
+  assert(victim < end);
+  return std::distance(begin, victim); // cast protected by assertions
+}
+
+
+
+Program 2:
+def find_victim(int cpu, int set, const int * current_set, int PC, int paddr, int type) -> int:
+uint32_t find_victim (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)
+{
+    // look for the maxRRPV line
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+        if (rrpv[set][i] == maxRRPV)
+            return i;
+
+    //If we cannot find a cache-averse line, we evict the oldest cache-friendly line
+    uint32_t max_rrip = 0;
+    int32_t lru_victim = -1;
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+    {
+        if (rrpv[set][i] >= max_rrip)
+        {
+            max_rrip = rrpv[set][i];
+            lru_victim = i;
+        }
+    }
+
+    assert (lru_victim!= -1);
+    //The predictor is trained negatively on LRU evictions
+    if( SAMPLED_SET(set) )
+    {
+        if(prefetched[set][lru_victim])
+            prefetch_predictor->decrement(signatures[set][lru_victim]);
+        else
+            demand_predictor->decrement(signatures[set][lru_victim]);
+    }
+    return lru_victim;
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+
+
+Program 3:
+def find_victim(int tid, int setIndex, const int * current_set, int assoc, int PC, int paddr, int accessType) -> int:
+int find_victim ( uint32_t tid, uint32_t setIndex, const BLOCK *current_set, uint32_t assoc, uint64_t PC, uint64_t paddr, uint32_t accessType) {
+
+	// select a victim using default pseudo LRU policy
+
+	assert (setIndex < llc_sets);
+	int r;
+	if (dan_use_rrip) {
+startover:
+		int lrus[LLC_WAYS], n = 0;
+		for (unsigned int wayID=0; wayID<assoc; wayID++) {
+			if (rrpv[setIndex][wayID] == 3) lrus[n++] = wayID;
+		}
+		if (n) {
+			r = lrus[rand()%n];
+		} else {
+			for (unsigned int wayID=0; wayID<assoc; wayID++) rrpv[setIndex][wayID]++;
+			goto startover;
+		}
+	} else {
+		r = get_mdpp_plru_victim (setIndex);
+	}
+	// we now have a victim, r; predict whether this block is
+	// "dead on arrival" and bypass for non-writeback accesses
+
+	if (accessType!= WRITEBACK) {
+		uint32_t tag = paddr / (llc_sets * 64);
+		make_trace (tid, samp->pred, setIndex, PC, tag, accessType, false, true, lastmiss_bits[setIndex], paddr & 63);
+		int prediction;
+		int conf = samp->pred->get_prediction (tid, setIndex);
+		if (dan_dt2) {
+			if (setIndex < leaders1) 
+				prediction = conf >= dan_dt1;
+			else if (setIndex < leaders2)
+				prediction = conf >= dan_dt2;
+			else {
+				if (psel >= 0)
+					prediction = conf >= dan_dt2;
+				else
+					prediction = conf >= dan_dt1;
+			}
+		} else {
+			prediction = conf >= dan_bypass_threshold;
+		}
+	
+		// if block is predicted dead, then it should bypass the cache
+	
+		if (prediction) {
+			r = LLC_WAYS; // means bypass
+		}
+	}
+
+	// return the selected victim
+
+	return r;
+}
+
+
+
+Using inspiration from the above, generate a new candidate program: 
+
+def find_victim(int cpu, int set, const int * current_set, int PC, int paddr, int type) -> int:
+uint32_t find_victim (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)
+{
+    // look for the maxRRPV line
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+        if (rrpv[set][i] == maxRRPV)
+            return i;
+
+    //If we cannot find a cache-averse line, we evict the oldest cache-friendly line
+    uint32_t max_rrip = 0;
+    int32_t lru_victim = -1;
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+    {
+        if (rrpv[set][i] >= max_rrip)
+        {
+            max_rrip = rrpv[set][i];
+            lru_victim = i;
+        }
+    }
+
+    assert (lru_victim!= -1);
+    //The predictor is trained negatively on LRU evictions
+    if( SAMPLED_SET(set
+TRIMMING FUNCTION BODY
+generated function name find_victim_vNone
+node
+child kind CursorKind.VAR_DECL
+child spelling inspiration
+child extent <SourceRange start <SourceLocation file 'tmp.cc', line 123, column 1>, end <SourceLocation file 'tmp.cc', line 123, column 18>>
+<|begin_of_text|>System: You are a code generation assistant. I need you to make a cache replacement policy for a cache simulator that maxmimzes the cache hit rate. Below I've provide some examples of policies and then a new policy for you to fill out with an improved version. Write out the C++ code for the new improved policy to improve on the existing policies. Only write one new policy in the function skeleton I provided for you at the end of the code. Code: Here are some candidate programs:
+
+Program 1:
+def find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const int * current_set, int ip, int full_addr, int type) -> long:
+long drrip::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
+                        champsim::address full_addr, access_type type)
+{
+  // look for the maxRRPV line
+  auto begin = std::next(std::begin(rrpv), set * NUM_WAY);
+  auto end = std::next(begin, NUM_WAY);
+
+  auto victim = std::max_element(begin, end);
+  if (auto rrpv_update = maxRRPV - *victim; rrpv_update!= 0)
+    for (auto it = begin; it!= end; ++it)
+      *it += rrpv_update;
+
+  assert(begin <= victim);
+  assert(victim < end);
+  return std::distance(begin, victim); // cast protected by assertions
+}
+
+
+
+Program 2:
+def find_victim(int cpu, int set, const int * current_set, int PC, int paddr, int type) -> int:
+uint32_t find_victim (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)
+{
+    // look for the maxRRPV line
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+        if (rrpv[set][i] == maxRRPV)
+            return i;
+
+    //If we cannot find a cache-averse line, we evict the oldest cache-friendly line
+    uint32_t max_rrip = 0;
+    int32_t lru_victim = -1;
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+    {
+        if (rrpv[set][i] >= max_rrip)
+        {
+            max_rrip = rrpv[set][i];
+            lru_victim = i;
+        }
+    }
+
+    assert (lru_victim!= -1);
+    //The predictor is trained negatively on LRU evictions
+    if( SAMPLED_SET(set) )
+    {
+        if(prefetched[set][lru_victim])
+            prefetch_predictor->decrement(signatures[set][lru_victim]);
+        else
+            demand_predictor->decrement(signatures[set][lru_victim]);
+    }
+    return lru_victim;
+
+    // WE SHOULD NOT REACH HERE
+    assert(0);
+    return 0;
+}
+
+
+
+Program 3:
+def find_victim(int tid, int setIndex, const int * current_set, int assoc, int PC, int paddr, int accessType) -> int:
+int find_victim ( uint32_t tid, uint32_t setIndex, const BLOCK *current_set, uint32_t assoc, uint64_t PC, uint64_t paddr, uint32_t accessType) {
+
+	// select a victim using default pseudo LRU policy
+
+	assert (setIndex < llc_sets);
+	int r;
+	if (dan_use_rrip) {
+startover:
+		int lrus[LLC_WAYS], n = 0;
+		for (unsigned int wayID=0; wayID<assoc; wayID++) {
+			if (rrpv[setIndex][wayID] == 3) lrus[n++] = wayID;
+		}
+		if (n) {
+			r = lrus[rand()%n];
+		} else {
+			for (unsigned int wayID=0; wayID<assoc; wayID++) rrpv[setIndex][wayID]++;
+			goto startover;
+		}
+	} else {
+		r = get_mdpp_plru_victim (setIndex);
+	}
+	// we now have a victim, r; predict whether this block is
+	// "dead on arrival" and bypass for non-writeback accesses
+
+	if (accessType!= WRITEBACK) {
+		uint32_t tag = paddr / (llc_sets * 64);
+		make_trace (tid, samp->pred, setIndex, PC, tag, accessType, false, true, lastmiss_bits[setIndex], paddr & 63);
+		int prediction;
+		int conf = samp->pred->get_prediction (tid, setIndex);
+		if (dan_dt2) {
+			if (setIndex < leaders1) 
+				prediction = conf >= dan_dt1;
+			else if (setIndex < leaders2)
+				prediction = conf >= dan_dt2;
+			else {
+				if (psel >= 0)
+					prediction = conf >= dan_dt2;
+				else
+					prediction = conf >= dan_dt1;
+			}
+		} else {
+			prediction = conf >= dan_bypass_threshold;
+		}
+	
+		// if block is predicted dead, then it should bypass the cache
+	
+		if (prediction) {
+			r = LLC_WAYS; // means bypass
+		}
+	}
+
+	// return the selected victim
+
+	return r;
+}
+
+
+
+Using inspiration from the above, generate a new candidate program: 
+
+def find_victim(int cpu, int set, const int * current_set, int PC, int paddr, int type) -> int:
+uint32_t find_victim (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)
+{
+    // look for the maxRRPV line
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+        if (rrpv[set][i] == maxRRPV)
+            return i;
+
+    //If we cannot find a cache-averse line, we evict the oldest cache-friendly line
+    uint32_t max_rrip = 0;
+    int32_t lru_victim = -1;
+    for (uint32_t i=0; i<LLC_WAYS; i++)
+    {
+        if (rrpv[set][i] >= max_rrip)
+        {
+            max_rrip = rrpv[set][i];
+            lru_victim = i;
+        }
+    }
+
+    assert (lru_victim!= -1);
+    //The predictor is trained negatively on LRU evictions
+    if( SAMPLED_SET(set
+AFTER
+<|begin_of_text|>System: You are a code generation assistant. I need you to make a cache replacement policy for a cache simulator that maxmimzes the cache hit rate. Below I've provide some examples of policies and then a new policy for you to fill out with an improved version. Write out the C++ code for the new improved policy to improve on the existing policies. Only write one new policy in the function skeleton I provided for you at the end of the code. Code: Here are some candidate programs:
+
+Program 1:
+def find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const int * current_set, int ip, int full_addr, int type) -> long:
+long drrip::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
+                        champsim::address full_addr, access_type type)
+{
+  // look for the maxRRPV line
+  auto begin = std::next(std::begin(rrpv), set * NUM_WAY);
+  auto end = std::next(begin, NUM_WAY);
+
+  auto victim = std::max_element(begin, end);
+  if (auto rrpv_update = maxRRPV - *victim; rrpv_update!= 0)
+    for (auto it = begin; it!= end; ++it)
+      *it += rrpv_update;
+
+  assert(begin <= victim);
+  assert(victim < end);
+  return std::distance(begin, victim); // cast protected by assertions
+}
+
+
+BODY after trimming
+<|begin_of_text|>System: You are a code generation assistant. I need you to make a cache replacement policy for a cache simulator that maxmimzes the cache hit rate. Below I've provide some examples of policies and then a new policy for you to fill out with an improved version. Write out the C++ code for the new improved policy to improve on the existing policies. Only write one new policy in the function skeleton I provided for you at the end of the code. Code: Here are some candidate programs:
+
+Program 1:
+def find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const int * current_set, int ip, int full_addr, int type) -> long:
+long drrip::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
+                        champsim::address full_addr, access_type type)
+{
+  // look for the maxRRPV line
+  auto begin = std::next(std::begin(rrpv), set * NUM_WAY);
+  auto end = std::next(begin, NUM_WAY);
+
+  auto victim = std::max_element(begin, end);
+  if (auto rrpv_update = maxRRPV - *victim; rrpv_update!= 0)
+    for (auto it = begin; it!= end; ++it)
+      *it += rrpv_update;
+
+  assert(begin <= victim);
+  assert(victim < end);
+  return std::distance(begin, victim); // cast protected by assertions
+}
+
+
+aryan [VMEM] WARNING: physical memory size is smaller than virtual memory size.
+WARNING: option --warmup_instructions is deprecated. Use --warmup-instructions instead.
+WARNING: option --simulation_instructions is deprecated. Use --simulation-instructions instead.
+
+*** ChampSim Multicore Out-of-Order Simulator ***
+Warmup Instructions: 200000
+Simulation Instructions: 500000
+Number of CPUs: 1
+Page size: 4096
+
+Off-chip DRAM Size: 16 GiB Channels: 1 Width: 64-bit Data Rate: 3205 MT/s
+Warmup finished CPU 0 instructions: 200000 cycles: 84507 cumulative IPC: 2.367 (Simulation time: 00 hr 00 min 01 sec)
+Warmup complete CPU 0 instructions: 200000 cycles: 84507 cumulative IPC: 2.367 (Simulation time: 00 hr 00 min 01 sec)
+Simulation finished CPU 0 instructions: 500000 cycles: 963424 cumulative IPC: 0.519 (Simulation time: 00 hr 00 min 09 sec)
+Simulation complete CPU 0 instructions: 500000 cycles: 963424 cumulative IPC: 0.519 (Simulation time: 00 hr 00 min 09 sec)
+
+ChampSim completed all CPUs
+
+=== Simulation ===
+CPU 0 runs ChampSim/astar_23B.trace.xz
+
+Region of Interest Statistics
+
+CPU 0 cumulative IPC: 0.519 instructions: 500000 cycles: 963424
+CPU 0 Branch Prediction Accuracy: 72.8% MPKI: 51.77 Average ROB Occupancy at Mispredict: 6.204
+Branch type MPKI
+BRANCH_DIRECT_JUMP: 0
+BRANCH_INDIRECT: 0
+BRANCH_CONDITIONAL: 51.77
+BRANCH_DIRECT_CALL: 0
+BRANCH_INDIRECT_CALL: 0
+BRANCH_RETURN: 0
+
+cpu0->cpu0_STLB TOTAL        ACCESS:      13983 HIT:      12015 MISS:       1968 MSHR_MERGE:          0
+cpu0->cpu0_STLB LOAD         ACCESS:      13983 HIT:      12015 MISS:       1968 MSHR_MERGE:          0
+cpu0->cpu0_STLB RFO          ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_STLB PREFETCH     ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_STLB WRITE        ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_STLB TRANSLATION  ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_STLB PREFETCH REQUESTED:          0 ISSUED:          0 USEFUL:          0 USELESS:          0
+cpu0->cpu0_STLB AVERAGE MISS LATENCY: 18.82 cycles
+cpu0->cpu0_L2C TOTAL        ACCESS:      21637 HIT:      15058 MISS:       6579 MSHR_MERGE:          0
+cpu0->cpu0_L2C LOAD         ACCESS:      15911 HIT:       9400 MISS:       6511 MSHR_MERGE:          0
+cpu0->cpu0_L2C RFO          ACCESS:        178 HIT:        168 MISS:         10 MSHR_MERGE:          0
+cpu0->cpu0_L2C PREFETCH     ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_L2C WRITE        ACCESS:       5322 HIT:       5322 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_L2C TRANSLATION  ACCESS:        226 HIT:        168 MISS:         58 MSHR_MERGE:          0
+cpu0->cpu0_L2C PREFETCH REQUESTED:          0 ISSUED:          0 USEFUL:          0 USELESS:          0
+cpu0->cpu0_L2C AVERAGE MISS LATENCY: 40.24 cycles
+cpu0->cpu0_L1I TOTAL        ACCESS:          6 HIT:          6 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_L1I LOAD         ACCESS:          6 HIT:          6 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_L1I RFO          ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_L1I PREFETCH     ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_L1I WRITE        ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_L1I TRANSLATION  ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_L1I PREFETCH REQUESTED:          0 ISSUED:          0 USEFUL:          0 USELESS:          0
+cpu0->cpu0_L1I AVERAGE MISS LATENCY: - cycles
+cpu0->cpu0_L1D TOTAL        ACCESS:     142118 HIT:     121711 MISS:      20407 MSHR_MERGE:       4092
+cpu0->cpu0_L1D LOAD         ACCESS:     118949 HIT:      98959 MISS:      19990 MSHR_MERGE:       4079
+cpu0->cpu0_L1D RFO          ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_L1D PREFETCH     ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_L1D WRITE        ACCESS:      21200 HIT:      21019 MISS:        181 MSHR_MERGE:          3
+cpu0->cpu0_L1D TRANSLATION  ACCESS:       1969 HIT:       1733 MISS:        236 MSHR_MERGE:         10
+cpu0->cpu0_L1D PREFETCH REQUESTED:          0 ISSUED:          0 USEFUL:          0 USELESS:          0
+cpu0->cpu0_L1D AVERAGE MISS LATENCY: 24.66 cycles
+cpu0->cpu0_ITLB TOTAL        ACCESS:          5 HIT:          5 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_ITLB LOAD         ACCESS:          5 HIT:          5 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_ITLB RFO          ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_ITLB PREFETCH     ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_ITLB WRITE        ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_ITLB TRANSLATION  ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_ITLB PREFETCH REQUESTED:          0 ISSUED:          0 USEFUL:          0 USELESS:          0
+cpu0->cpu0_ITLB AVERAGE MISS LATENCY: - cycles
+cpu0->cpu0_DTLB TOTAL        ACCESS:     139468 HIT:     121853 MISS:      17615 MSHR_MERGE:       3632
+cpu0->cpu0_DTLB LOAD         ACCESS:     139468 HIT:     121853 MISS:      17615 MSHR_MERGE:       3632
+cpu0->cpu0_DTLB RFO          ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_DTLB PREFETCH     ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_DTLB WRITE        ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_DTLB TRANSLATION  ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->cpu0_DTLB PREFETCH REQUESTED:          0 ISSUED:          0 USEFUL:          0 USELESS:          0
+cpu0->cpu0_DTLB AVERAGE MISS LATENCY: 7.791 cycles
+cpu0->LLC TOTAL        ACCESS:       8587 HIT:       7576 MISS:       1011 MSHR_MERGE:          0
+cpu0->LLC LOAD         ACCESS:       6508 HIT:       5502 MISS:       1006 MSHR_MERGE:          0
+cpu0->LLC RFO          ACCESS:         10 HIT:         10 MISS:          0 MSHR_MERGE:          0
+cpu0->LLC PREFETCH     ACCESS:          0 HIT:          0 MISS:          0 MSHR_MERGE:          0
+cpu0->LLC WRITE        ACCESS:       2011 HIT:       2011 MISS:          0 MSHR_MERGE:          0
+cpu0->LLC TRANSLATION  ACCESS:         58 HIT:         53 MISS:          5 MSHR_MERGE:          0
+cpu0->LLC PREFETCH REQUESTED:          0 ISSUED:          0 USEFUL:          0 USELESS:          0
+cpu0->LLC AVERAGE MISS LATENCY: 163.3 cycles
+
+DRAM Statistics
+
+Channel 0 RQ ROW_BUFFER_HIT:          0
+  ROW_BUFFER_MISS:       1011
+  AVG DBUS CONGESTED CYCLE: 2.514
+Channel 0 WQ ROW_BUFFER_HIT:          0
+  ROW_BUFFER_MISS:          0
+  FULL:          0
+Channel 0 REFRESHES ISSUED:         80
+
+
+------------------------------------------------------------
+Sender: LSF System <lsfadmin@gpu04>
+Subject: Job 485475: <train_rl> in cluster <Hazel> Done
+
+Job <train_rl> was submitted from host <login03> by user <ainguva> in cluster <Hazel> at Sun Apr 27 22:15:51 2025
+Job was executed on host(s) <16*gpu04>, in queue <gpu>, as user <ainguva> in cluster <Hazel> at Sun Apr 27 22:16:44 2025
+</home/ainguva> was used as the home directory.
+</share/csc591s25/bpreier_ttran_dshrest/GenAI-for-Systems-Gym/project/funsearch/implementation> was used as the working directory.
+Started at Sun Apr 27 22:16:44 2025
+Terminated at Sun Apr 27 22:18:44 2025
+Results reported at Sun Apr 27 22:18:44 2025
+
+Your job looked like:
+
+------------------------------------------------------------
+# LSBATCH: User input
+#!/bin/bash
+#BSUB -n 16
+#BSUB -W 16:00
+#BSUB -q gpu
+#BSUB -gpu "num=1"
+#BSUB -J train_rl
+#BSUB -o /share/csc591s25/bpreier_ttran_dshrest/GenAI-for-Systems-Gym/project/logs/train_rl.out.%J
+#BSUB -e /share/csc591s25/bpreier_ttran_dshrest/GenAI-for-Systems-Gym/project/logs/train_rl.err.%J
+
+# 1) load bash profile
+source ~/.bashrc
+
+# 2) activate the HW2 env where we just installed SB3, Gym, Transformers, etc.
+conda activate /share/csc591s25/bpreier_ttran_dshrest/hw2_env_new
+
+# 3) cd to the project root
+cd /share/csc591s25/bpreier_ttran_dshrest/GenAI-for-Systems-Gym/project
+
+# 4) sandbox all caches under project/.cache (avoids home-dir quota issues)
+export XDG_CACHE_HOME="$PWD/.cache"
+export MPLCONFIGDIR="$PWD/.cache/matplotlib"
+export HF_DATASETS_CACHE="$PWD/.cache/hf/datasets"
+export HF_TRANSFORMERS_CACHE="$PWD/.cache/hf/transformers"
+export HF_HOME="$PWD/.cache/hf"
+mkdir -p \
+  "$XDG_CACHE_HOME" \
+  "$MPLCONFIGDIR" \
+  "$HF_DATASETS_CACHE" \
+  "$HF_TRANSFORMERS_CACHE" \
+  "$HF_HOME"
+
+# 5) improve PyTorch CUDA fragmentation behavior
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# 6) run the RL training via the package entrypoint
+python -m funsearch.implementation.train_rl
+
+# 7) deactivate when done
+conda deactivate
+
+------------------------------------------------------------
+
+Successfully completed.
+
+Resource usage summary:
+
+    CPU time :                                   79.45 sec.
+    Max Memory :                                 1 GB
+    Average Memory :                             0.80 GB
+    Total Requested Memory :                     -
+    Delta Memory :                               -
+    Max Swap :                                   -
+    Max Processes :                              5
+    Max Threads :                                34
+    Run time :                                   137 sec.
+    Turnaround time :                            173 sec.
+
+The output (if any) is above this job summary.
+
+
+
+PS:
+
+Read file </share/csc591s25/bpreier_ttran_dshrest/GenAI-for-Systems-Gym/project/logs/train_rl.err.485475> for stderr output of this job.
+
