@@ -1,0 +1,118 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Project-specific generated files
+logs/
+*.log
+*.out
+*.err
+
+# Generated policies (runtime artifacts)
+funsearch/implementation/policies/*.cc
+funsearch/implementation/policies/*.txt
+!funsearch/implementation/starting_policies/
+
+# Temporary files
+tmp.cc
+tmp.*
+*.tmp
+
+# Cache hit rate tracking (runtime artifact)
+funsearch/implementation/cache_hit_rates.txt
+funsearch/implementation/best_output.txt
+funsearch/implementation/example_output.txt
+
+# Model checkpoints (large files)
+models/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# ChampSim (external dependency - should be cloned separately)
+ChampSim/
+
+# Training data
+data/
+*.json
+!llm_training_data_with_program_semantics.json

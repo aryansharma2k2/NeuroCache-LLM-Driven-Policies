@@ -66,11 +66,10 @@ class Sampler:
       database: programs_database.ProgramsDatabase,
       evaluators: Sequence[evaluator.Evaluator],
       samples_per_prompt: int,
+      model_path: str = "models/",  # Configure your model path here or pass as parameter
   ) -> None:
     self._database = database
     self._evaluators = evaluators
-    model_path = "models/checkpoint-48000/"
-    model_path = "../homework-2/RAG/LLAMA"
     import torch
     print(torch.cuda.is_available())
     bnb_config = BitsAndBytesConfig(
